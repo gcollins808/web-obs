@@ -124,9 +124,12 @@ interface BrandBadgeRuntime {
 
 interface RuntimeEdgeEntry {
   edge: SiteEdge;
-  line: THREE.Line;
-  geom: THREE.BufferGeometry;
-  mat: THREE.LineBasicMaterial;
+  /** Index of this edge's run of vertices in the shared edge buffers. */
+  slot: number;
+  /** Alpha last written to the shared colour buffer, so unchanged edges cost nothing. */
+  alpha: number;
+  src: RuntimeNodeEntry | undefined;
+  dst: RuntimeNodeEntry | undefined;
   pulseSlot: number;
   pulsePhase: number;
   ambientEligible: boolean;
@@ -692,6 +695,18 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
     const runtimeEdges = new Map<string, RuntimeEdgeEntry>();
     const pickableMeshes: THREE.Mesh[] = [];
 
+    // Every edge lives in one LineSegments object: one draw call and one material however many links the
+    // site has. Colour carries per-edge alpha (RGBA), so a hidden or dimmed edge is a buffer write, not an object.
+    // The curve is cut into fewer segments as the edge count grows, which keeps the buffers small on big sites.
+    let edgeBuffers: {
+      lines: THREE.LineSegments<THREE.BufferGeometry, THREE.LineBasicMaterial>;
+      segments: number;
+      position: THREE.BufferAttribute;
+      color: THREE.BufferAttribute;
+    } | null = null;
+    const edgeSegmentsFor = (edgeCount: number) =>
+      edgeCount <= 300 ? 20 : edgeCount <= 1500 ? 12 : edgeCount <= 6000 ? 6 : 3;
+
     let pulseCapacity = 128;
     let pulseInstanced = new THREE.InstancedMesh(pulseGeom, pulseMat, pulseCapacity);
     pulseInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -714,12 +729,13 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       runtimeNodes.clear();
       pickableMeshes.length = 0;
 
-      runtimeEdges.forEach((re) => {
-        re.geom.dispose();
-        re.mat.dispose();
-        edgesRoot.remove(re.line);
-      });
       runtimeEdges.clear();
+      if (edgeBuffers) {
+        edgesRoot.remove(edgeBuffers.lines);
+        edgeBuffers.lines.geometry.dispose();
+        edgeBuffers.lines.material.dispose();
+        edgeBuffers = null;
+      }
       pulseInstanced.count = 0;
     };
 
@@ -987,25 +1003,31 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         }
       }
 
-      nextManifest.edges.forEach((edge, idx) => {
+      {
+        const segments = edgeSegmentsFor(nextManifest.edges.length);
+        const vertexCount = Math.max(1, nextManifest.edges.length * segments * 2);
         const geom = new THREE.BufferGeometry();
-        geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(21 * 3), 3));
-        geom.setAttribute('color', new THREE.BufferAttribute(new Float32Array(21 * 3), 3));
-        const mat = new THREE.LineBasicMaterial({
-          color: 0xffffff,
-          vertexColors: true,
-          transparent: true,
-          opacity: edge.kind === 'sitemap-hierarchy' ? 0.36 : 0.24,
-          depthWrite: false,
-        });
-        const line = new THREE.Line(geom, mat);
-        edgesRoot.add(line);
+        const position = new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3);
+        const color = new THREE.BufferAttribute(new Float32Array(vertexCount * 4), 4);
+        position.setUsage(THREE.DynamicDrawUsage);
+        color.setUsage(THREE.DynamicDrawUsage);
+        geom.setAttribute('position', position);
+        geom.setAttribute('color', color);
+        const mat = new THREE.LineBasicMaterial({ color: 0xffffff, vertexColors: true, transparent: true, depthWrite: false });
+        const lines = new THREE.LineSegments(geom, mat);
+        // Positions change every frame while nodes move, so a stale bounding sphere would cull the whole set.
+        lines.frustumCulled = false;
+        edgesRoot.add(lines);
+        edgeBuffers = { lines, segments, position, color };
+      }
 
+      nextManifest.edges.forEach((edge, idx) => {
         runtimeEdges.set(edge.id, {
           edge,
-          line,
-          geom,
-          mat,
+          slot: idx,
+          alpha: -1,
+          src: runtimeNodes.get(edge.source),
+          dst: runtimeNodes.get(edge.target),
           pulseSlot: idx,
           pulsePhase: ((idx * 0.61803398875) % 1),
           ambientEligible: ambientSet.has(idx),
@@ -1490,9 +1512,16 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         Math.min(1, Math.sqrt(85 / Math.max(85, runtimeEdges.size)))
       );
 
+      const eb = edgeBuffers;
+      const segs = eb ? eb.segments : 1;
+      const posArr = eb ? (eb.position.array as Float32Array) : null;
+      const colArr = eb ? (eb.color.array as Float32Array) : null;
+      let edgePosDirty = false;
+      let edgeColDirty = false;
+
       runtimeEdges.forEach((re) => {
-        const srcEntry = runtimeNodes.get(re.edge.source);
-        const dstEntry = runtimeNodes.get(re.edge.target);
+        const srcEntry = re.src;
+        const dstEntry = re.dst;
         const isDirectConnection = Boolean(focusId) && (re.edge.source === focusId || re.edge.target === focusId);
         const isStructural = re.edge.kind === 'sitemap-hierarchy' ||
           re.edge.kind === 'external' || re.edge.kind === 'internal-chrome' ||
@@ -1505,8 +1534,14 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
           (re.edge.kind !== 'external' || st.showExternal) &&
           (st.showAllLinks || isDirectConnection || isStructural);
 
-        re.line.visible = edgeAllowed;
-        if (!edgeAllowed || !srcEntry || !dstEntry) {
+        const first = re.slot * segs * 2 * 4;
+        const vertexTotal = segs * 2;
+        if (!edgeAllowed || !srcEntry || !dstEntry || !posArr || !colArr) {
+          if (colArr && re.alpha !== 0) {
+            for (let v = 0; v < vertexTotal; v++) colArr[first + v * 4 + 3] = 0;
+            re.alpha = 0;
+            edgeColDirty = true;
+          }
           pulseInstanced.setMatrixAt(re.pulseSlot, hiddenMat4);
           return;
         }
@@ -1552,34 +1587,38 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
           }
           re.p1.copy(tmpMid);
 
-          const posAttr = re.geom.getAttribute('position') as THREE.BufferAttribute;
-          const colAttr = re.geom.getAttribute('color') as THREE.BufferAttribute;
           tmpColorA.setHex(srcHex);
           tmpColorB.setHex(dstHex);
 
-          for (let s = 0; s <= 20; s++) {
-            const t = s / 20;
+          // Walk the curve and write each piece as a separate line segment (start and end vertex).
+          let prevX = re.p0.x, prevY = re.p0.y, prevZ = re.p0.z;
+          let prevR = tmpColorA.r, prevG = tmpColorA.g, prevB = tmpColorA.b;
+          for (let s = 1; s <= segs; s++) {
+            const t = s / segs;
             const inv = 1 - t;
             const x = inv * inv * re.p0.x + 2 * inv * t * re.p1.x + t * t * re.p2.x;
             const y = inv * inv * re.p0.y + 2 * inv * t * re.p1.y + t * t * re.p2.y;
             const z = inv * inv * re.p0.z + 2 * inv * t * re.p1.z + t * t * re.p2.z;
-            posAttr.setXYZ(s, x, y, z);
-            colAttr.setXYZ(
-              s,
-              THREE.MathUtils.lerp(tmpColorA.r, tmpColorB.r, t),
-              THREE.MathUtils.lerp(tmpColorA.g, tmpColorB.g, t),
-              THREE.MathUtils.lerp(tmpColorA.b, tmpColorB.b, t)
-            );
+            const r = tmpColorA.r + (tmpColorB.r - tmpColorA.r) * t;
+            const g = tmpColorA.g + (tmpColorB.g - tmpColorA.g) * t;
+            const b = tmpColorA.b + (tmpColorB.b - tmpColorA.b) * t;
+            const p = (re.slot * segs + (s - 1)) * 2;
+            const pi = p * 3;
+            posArr[pi] = prevX; posArr[pi + 1] = prevY; posArr[pi + 2] = prevZ;
+            posArr[pi + 3] = x; posArr[pi + 4] = y; posArr[pi + 5] = z;
+            const ci = p * 4;
+            colArr[ci] = prevR; colArr[ci + 1] = prevG; colArr[ci + 2] = prevB;
+            colArr[ci + 4] = r; colArr[ci + 5] = g; colArr[ci + 6] = b;
+            prevX = x; prevY = y; prevZ = z; prevR = r; prevG = g; prevB = b;
           }
-          posAttr.needsUpdate = true;
-          colAttr.needsUpdate = true;
-          re.geom.computeBoundingSphere();
+          edgePosDirty = true;
+          edgeColDirty = true;
         }
 
         const isHighlighted =
           Boolean(focusId) && (re.edge.source === focusId || re.edge.target === focusId);
         const isDimmed = Boolean(focusId) && !isHighlighted;
-        re.mat.opacity = isHighlighted
+        const alpha = isHighlighted
           ? 0.72
           : isDimmed
             ? 0.035
@@ -1588,6 +1627,11 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
                 : re.edge.kind === 'external'
                   ? 0.12
                   : 0.16) * densityScale;
+        if (Math.abs(alpha - re.alpha) > 1e-4) {
+          for (let v = 0; v < vertexTotal; v++) colArr[first + v * 4 + 3] = alpha;
+          re.alpha = alpha;
+          edgeColDirty = true;
+        }
 
         const shouldAnimatePulse =
           st.showPulses && (focusId ? isHighlighted : re.ambientEligible);
@@ -1601,6 +1645,10 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         }
       });
 
+      if (eb) {
+        if (edgePosDirty) eb.position.needsUpdate = true;
+        if (edgeColDirty) eb.color.needsUpdate = true;
+      }
       pulseInstanced.instanceMatrix.needsUpdate = true;
 
       renderer.render(scene, camera);
