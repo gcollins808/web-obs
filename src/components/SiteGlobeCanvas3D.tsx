@@ -87,27 +87,92 @@ interface ScreenBox {
   b: number;
 }
 
-interface RuntimeNodeEntry {
-  node: SiteNode;
+/**
+ * A pooled DOM label. Only nodes that are showing a label hold one, so a site with thousands of pages
+ * builds a few hundred pills at most instead of one per page.
+ */
+interface LabelSlot {
+  el: HTMLDivElement;
+  textEl: HTMLSpanElement;
+  badgeEl: HTMLSpanElement | null;
+  obj: CSS2DObject;
+  entry: RuntimeNodeEntry | null;
+}
+
+/** Home node only: a standalone sphere (and brand badge). Every other node is an instance of a shared mesh. */
+interface HomeRuntime {
   group: THREE.Group;
   coreMesh: THREE.Mesh;
-  haloMesh: THREE.Mesh;
   coreMat: THREE.MeshStandardMaterial;
-  haloMat: THREE.MeshBasicMaterial;
-  cssObj: CSS2DObject;
-  labelEl: HTMLDivElement;
+}
+
+interface RuntimeNodeEntry {
+  node: SiteNode;
+  /** Slot in the shared instance buffers (the same index is used by the core meshes and the halo). */
+  index: number;
+  baseRadius: number;
+  /** Radius the halo ring is drawn around. */
+  haloScale: number;
+  /** Passed the filter on the last sync. */
+  visible: boolean;
+  /** Which core mesh draws this node: 0 normal, 1 dimmed, 2 focused, -1 none. */
+  bucket: number;
+  colorHex: number;
+  haloAlpha: number;
+  haloHex: number;
+  /** True for the frame after a node stopped moving, so its final position is written once. */
+  posDirty: boolean;
   currentPos: THREE.Vector3;
   targetPos: THREE.Vector3;
+  pillText: string;
   pillW: number;
   pillH: number;
   /** True once the label was laid out in the DOM and its real size read. */
   pillMeasured: boolean;
+  /** Height of the label anchor above the node centre. */
+  labelOffsetY: number;
+  label: LabelSlot | null;
+  home?: HomeRuntime;
   /** Home node only: the brand badge drawn in place of the sphere. */
   badge?: BrandBadgeRuntime;
 }
 
+interface LabelCandidate {
+  entry: RuntimeNodeEntry;
+  priority: number;
+  isDirect: boolean;
+  isHoverTarget: boolean;
+  isNeighbor: boolean;
+  dimmed: boolean;
+}
+
+/** All non-home nodes share three instanced spheres and every halo is one instanced billboard. */
+interface NodeInstancing {
+  coreGeom: THREE.SphereGeometry;
+  /** [normal, dimmed, focused]: separate meshes because emissive strength and opacity are per material. */
+  buckets: THREE.InstancedMesh[];
+  mats: THREE.MeshStandardMaterial[];
+  halo: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.ShaderMaterial>;
+  haloCenter: THREE.InstancedBufferAttribute;
+  haloColor: THREE.InstancedBufferAttribute;
+  haloSize: THREE.InstancedBufferAttribute;
+  byIndex: RuntimeNodeEntry[];
+}
+
+interface LabelContext {
+  candidates: LabelCandidate[];
+  focusId: string | null;
+  hoverId: string | null;
+  connectedIds: Set<string>;
+}
+
 /** Badge diameter as a multiple of the home sphere's radius (the sphere itself is 2). */
 const BADGE_SCALE = 2.8;
+
+/** A label pill is about 70 by 24 px, so more than this cannot be placed on a screen without overlap. */
+const MAX_LABEL_CANDIDATES = 320;
+/** The halo quad spans this many node radii; the ring itself runs from 1.32 to 1.65. */
+const HALO_PAD = 1.7;
 
 interface BrandBadgeRuntime {
   mark: BrandMark;
@@ -679,8 +744,10 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       cameraFlyRef.current = { active: true, lookTarget: fit.lookTarget, camTarget: fit.camTarget };
     };
 
-    const unitSphereGeom = track(new THREE.SphereGeometry(1, 22, 22));
-    const unitHaloGeom = track(new THREE.RingGeometry(1.32, 1.65, 28));
+    const homeSphereGeom = track(new THREE.SphereGeometry(1, 22, 22));
+    const hiddenInstanceMat = new THREE.Matrix4().compose(
+      new THREE.Vector3(1e9, 1e9, 1e9), new THREE.Quaternion(), new THREE.Vector3(0, 0, 0)
+    );
     const pulseGeom = track(new THREE.SphereGeometry(0.017, 8, 8));
     const pulseMat = track(
       new THREE.MeshBasicMaterial({
@@ -693,7 +760,88 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
 
     const runtimeNodes = new Map<string, RuntimeNodeEntry>();
     const runtimeEdges = new Map<string, RuntimeEdgeEntry>();
-    const pickableMeshes: THREE.Mesh[] = [];
+    // Picking targets: the home sphere plus the instanced node meshes (see NodeInstancing).
+    let pickTargets: THREE.Object3D[] = [];
+    let nodeInst: NodeInstancing | null = null;
+
+    // Pooled labels live under their own group so each follows its node through the spin group.
+    const labelsRoot = new THREE.Group();
+    sceneSpinGroup.add(labelsRoot);
+    const labelPool: LabelSlot[] = [];
+    const freeLabels: LabelSlot[] = [];
+    let forceLabels = false;
+    const emptyLabelContext = (): LabelContext => ({ candidates: [], focusId: null, hoverId: null, connectedIds: new Set() });
+    let labelCtx: LabelContext = emptyLabelContext();
+
+    const createLabelSlot = (): LabelSlot => {
+      const el = document.createElement('div');
+      el.className = 'wo-node-pill is-hidden';
+      el.setAttribute('role', 'button');
+      el.tabIndex = 0;
+      const dotEl = document.createElement('span');
+      dotEl.className = 'wo-pill-dot';
+      const textEl = document.createElement('span');
+      textEl.className = 'wo-pill-label';
+      el.append(dotEl, textEl);
+      const slot: LabelSlot = { el, textEl, badgeEl: null, obj: new CSS2DObject(el), entry: null };
+      // The handlers read the slot's current node, so a slot can be handed from one node to another.
+      el.addEventListener('pointerenter', () => { if (slot.entry) callbacksRef.current.onHoverNode(slot.entry.node.id); });
+      el.addEventListener('pointerleave', () => { callbacksRef.current.onHoverNode(null); });
+      el.addEventListener('click', (ev) => { ev.stopPropagation(); if (slot.entry) selectFromMap(slot.entry.node.id); });
+      el.addEventListener('focus', () => { if (slot.entry) callbacksRef.current.onHoverNode(slot.entry.node.id); });
+      el.addEventListener('blur', () => callbacksRef.current.onHoverNode(null));
+      el.addEventListener('keydown', (event) => {
+        if (!slot.entry) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          event.stopPropagation();
+          selectFromMap(slot.entry.node.id);
+        }
+      });
+      el.addEventListener('dblclick', (ev) => {
+        ev.stopPropagation();
+        if (!slot.entry) return;
+        selectFromMap(slot.entry.node.id);
+        callbacksRef.current.onOpenNoteNode?.(slot.entry.node);
+      });
+      slot.obj.visible = false;
+      labelsRoot.add(slot.obj);
+      labelPool.push(slot);
+      return slot;
+    };
+
+    const bindLabel = (entry: RuntimeNodeEntry) => {
+      const slot = freeLabels.pop() ?? createLabelSlot();
+      const { node } = entry;
+      slot.entry = entry;
+      entry.label = slot;
+      slot.el.className = `wo-node-pill wo-health-${node.health} wo-kind-${node.kind}`;
+      slot.el.dataset.nodeId = node.id;
+      slot.textEl.textContent = entry.pillText;
+      slot.badgeEl?.remove();
+      slot.badgeEl = null;
+      if (node.health === 'orphan' || node.health === 'broken' || node.health === 'unlisted') {
+        const badgeEl = document.createElement('span');
+        badgeEl.className = 'wo-pill-badge';
+        badgeEl.textContent =
+          node.health === 'broken' ? String(node.statusCode || 404) : node.health === 'orphan' ? 'orphan' : 'unlisted';
+        slot.el.appendChild(badgeEl);
+        slot.badgeEl = badgeEl;
+      }
+      slot.el.setAttribute('aria-label', `${slot.el.textContent}. Inspect ${node.title}`);
+      slot.obj.visible = true;
+    };
+
+    const unbindLabel = (entry: RuntimeNodeEntry) => {
+      const slot = entry.label;
+      if (!slot) return;
+      slot.entry = null;
+      entry.label = null;
+      slot.el.classList.add('is-hidden');
+      delete slot.el.dataset.nodeId;
+      slot.obj.visible = false;
+      freeLabels.push(slot);
+    };
 
     // Every edge lives in one LineSegments object: one draw call and one material however many links the
     // site has. Colour carries per-edge alpha (RGBA), so a hidden or dimmed edge is a buffer write, not an object.
@@ -713,21 +861,37 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
     pulseInstanced.frustumCulled = false;
     edgesRoot.add(pulseInstanced);
 
+    const disposeNodeInstancing = () => {
+      if (!nodeInst) return;
+      for (const mesh of nodeInst.buckets) {
+        nodesRoot.remove(mesh);
+        mesh.dispose();
+      }
+      nodesRoot.remove(nodeInst.halo);
+      nodeInst.halo.geometry.dispose();
+      nodeInst.halo.material.dispose();
+      nodeInst.coreGeom.dispose();
+      for (const mat of nodeInst.mats) mat.dispose();
+      nodeInst = null;
+    };
+
     const clearRuntimeGraph = () => {
       runtimeNodes.forEach((entry) => {
-        entry.group.remove(entry.cssObj);
-        entry.labelEl.remove();
-        entry.coreMat.dispose();
-        entry.haloMat.dispose();
+        unbindLabel(entry);
         if (entry.badge) {
           entry.badge.disposed = true;
           entry.badge.texture.dispose();
           entry.badge.material.dispose();
         }
-        nodesRoot.remove(entry.group);
+        if (entry.home) {
+          nodesRoot.remove(entry.home.group);
+          entry.home.coreMat.dispose();
+        }
       });
       runtimeNodes.clear();
-      pickableMeshes.length = 0;
+      pickTargets = [];
+      disposeNodeInstancing();
+      labelCtx = emptyLabelContext();
 
       runtimeEdges.clear();
       if (edgeBuffers) {
@@ -792,11 +956,105 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       const palette =
         stateRef.current.theme === 'dark' ? HEALTH_COLORS_DARK : HEALTH_COLORS_LIGHT;
 
-      for (const node of nextManifest.nodes) {
-        const initPos = curLayouts.globe.get(node.id) ?? [0, 0, 0];
-        const group = new THREE.Group();
-        group.position.set(initPos[0], initPos[1], initPos[2]);
+      // Every node except home is an instance of one shared sphere, so a site with thousands of pages costs a
+      // handful of draw calls and three materials instead of two meshes and two materials per page. Sphere
+      // detail drops as the count rises: a few hundred triangles per node is invisible once there are thousands.
+      const nodeCount = nextManifest.nodes.length;
+      const capacity = Math.max(1, nodeCount);
+      const [widthSegs, heightSegs] = nodeCount > 1200 ? [10, 8] : nodeCount > 400 ? [14, 10] : [22, 22];
+      const coreGeom = new THREE.SphereGeometry(1, widthSegs, heightSegs);
+      // The instance colour is the node colour, and emissive follows it: the same glow as a per-node material.
+      const makeCoreMaterial = (emissiveIntensity: number, opacity: number) => {
+        const mat = new THREE.MeshStandardMaterial({
+          color: 0xffffff,
+          emissive: 0xffffff,
+          emissiveIntensity,
+          roughness: 0.28,
+          metalness: 0.18,
+          transparent: opacity < 1,
+          opacity,
+          depthWrite: opacity >= 1,
+        });
+        mat.onBeforeCompile = (shader) => {
+          shader.fragmentShader = shader.fragmentShader.replace(
+            '#include <emissivemap_fragment>',
+            '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance *= diffuseColor.rgb;'
+          );
+        };
+        mat.customProgramCacheKey = () => 'web-obs-instanced-emissive';
+        return mat;
+      };
+      const mats = [makeCoreMaterial(0.32, 1), makeCoreMaterial(0.08, 0.22), makeCoreMaterial(0.85, 1)];
+      const white = new THREE.Color(1, 1, 1);
+      const buckets = mats.map((mat) => {
+        const mesh = new THREE.InstancedMesh(coreGeom, mat, capacity);
+        mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        mesh.count = nodeCount;
+        mesh.frustumCulled = false;
+        // Hidden instances sit far away, so a bounding sphere computed from them is useless; the ray test uses this one.
+        mesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e12);
+        for (let i = 0; i < capacity; i++) {
+          mesh.setMatrixAt(i, hiddenInstanceMat);
+          mesh.setColorAt(i, white);
+        }
+        mesh.instanceColor!.setUsage(THREE.DynamicDrawUsage);
+        nodesRoot.add(mesh);
+        return mesh;
+      });
 
+      // Every halo ring is one instanced camera-facing quad: no per-node object, and no rotation to keep in step.
+      const haloGeom = new THREE.InstancedBufferGeometry();
+      haloGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0]), 3));
+      haloGeom.setIndex([0, 1, 2, 0, 2, 3]);
+      const haloCenter = new THREE.InstancedBufferAttribute(new Float32Array(capacity * 3), 3);
+      const haloColor = new THREE.InstancedBufferAttribute(new Float32Array(capacity * 4), 4);
+      const haloSize = new THREE.InstancedBufferAttribute(new Float32Array(capacity), 1);
+      for (const attr of [haloCenter, haloColor, haloSize]) attr.setUsage(THREE.DynamicDrawUsage);
+      haloGeom.setAttribute('iCenter', haloCenter);
+      haloGeom.setAttribute('iColor', haloColor);
+      haloGeom.setAttribute('iSize', haloSize);
+      haloGeom.instanceCount = nodeCount;
+      const haloMat = new THREE.ShaderMaterial({
+        transparent: true,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        vertexShader: `
+          attribute vec3 iCenter;
+          attribute vec4 iColor;
+          attribute float iSize;
+          varying vec2 vUv;
+          varying vec4 vColor;
+          void main() {
+            vec4 mv = modelViewMatrix * vec4(iCenter, 1.0);
+            mv.xy += position.xy * iSize;
+            vUv = position.xy;
+            vColor = iColor;
+            gl_Position = projectionMatrix * mv;
+          }`,
+        fragmentShader: `
+          varying vec2 vUv;
+          varying vec4 vColor;
+          void main() {
+            // The quad spans ${HALO_PAD} radii; the ring runs from 1.32 to 1.65 radii.
+            float r = length(vUv);
+            float aa = max(fwidth(r), 0.002);
+            float inner = ${(1.32 / HALO_PAD).toFixed(5)};
+            float outer = ${(1.65 / HALO_PAD).toFixed(5)};
+            float a = smoothstep(inner - aa, inner + aa, r) * (1.0 - smoothstep(outer - aa, outer + aa, r));
+            if (a < 0.004) discard;
+            gl_FragColor = vec4(vColor.rgb, vColor.a * a);
+            #include <colorspace_fragment>
+          }`,
+      });
+      const halo = new THREE.Mesh(haloGeom, haloMat);
+      halo.frustumCulled = false;
+      nodesRoot.add(halo);
+
+      const byIndex: RuntimeNodeEntry[] = [];
+      const homeTargets: THREE.Object3D[] = [];
+
+      nextManifest.nodes.forEach((node, index) => {
+        const initPos = curLayouts.globe.get(node.id) ?? [0, 0, 0];
         const baseRadius =
           node.kind === 'home'
             ? 0.34
@@ -805,152 +1063,103 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
               : node.kind === 'external-domain'
                 ? 0.115
                 : 0.135;
-
         const hex = palette[node.health] ?? palette.healthy;
-        const coreMat = new THREE.MeshStandardMaterial({
-          color: hex,
-          emissive: hex,
-          emissiveIntensity: node.kind === 'home' ? 0.55 : 0.28,
-          roughness: 0.28,
-          metalness: 0.18,
-        });
-        const coreMesh = new THREE.Mesh(unitSphereGeom, coreMat);
-        coreMesh.scale.setScalar(baseRadius);
-        coreMesh.userData = { nodeId: node.id };
-        group.add(coreMesh);
-        pickableMeshes.push(coreMesh);
-
-        const haloMat = new THREE.MeshBasicMaterial({
-          color: hex,
-          transparent: true,
-          opacity: node.kind === 'home' || node.health === 'orphan' || node.health === 'broken' ? 0.55 : 0.22,
-          side: THREE.DoubleSide,
-          depthWrite: false,
-        });
-        const haloMesh = new THREE.Mesh(unitHaloGeom, haloMat);
-        haloMesh.scale.setScalar(baseRadius);
-        group.add(haloMesh);
-
-        // The home node shows the site's own mark. The sphere stays as an invisible depth occluder
-        // and click target, so links still end at the centre and picking is unchanged.
-        let badge: BrandBadgeRuntime | undefined;
-        const mark = node.kind === 'home' ? pickBrandMark(nextManifest) : null;
-        if (mark) {
-          const canvas = document.createElement('canvas');
-          const texture = new THREE.CanvasTexture(canvas);
-          texture.colorSpace = THREE.SRGBColorSpace;
-          texture.anisotropy = 4;
-          // Drawn last and without a depth test, so pages in front never hide the site's mark.
-          const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false, depthTest: false });
-          const sprite = new THREE.Sprite(material);
-          sprite.scale.setScalar(baseRadius * BADGE_SCALE);
-          sprite.renderOrder = 10;
-          group.add(sprite);
-          haloMesh.scale.setScalar(baseRadius * (BADGE_SCALE / 2) * 0.82);
-          coreMat.colorWrite = false;
-          // The invisible sphere is the click target, so it grows to the badge's full size, rim included.
-          coreMesh.scale.setScalar(baseRadius * (BADGE_SCALE / 2));
-          badge = { mark, canvas, texture, material, sprite, logo: null, theme: null, ringHex: hex, disposed: false };
-          const reader = assetReaderRef.current;
-          if (reader && mark.logoCandidates.length > 0) {
-            const target = badge;
-            void (async () => {
-              // First candidate that decodes and actually paints something; otherwise keep the initials.
-              for (const candidate of mark.logoCandidates) {
-                try {
-                  const bytes = await reader(candidate.path);
-                  if (target.disposed) return;
-                  if (!bytes) continue;
-                  const img = await decodeLogo(bytes, candidate.path);
-                  if (target.disposed) return;
-                  if (!img) continue;
-                  const tone = analyseLogo(img);
-                  if (tone.coverage < MIN_LOGO_COVERAGE) continue;
-                  target.logo = { img, tone };
-                  target.theme = null; // redraw on the next frame
-                  renderVersionRef.current += 1;
-                  return;
-                } catch {
-                  // Try the next candidate.
-                }
-              }
-            })();
-          }
-        }
-
         const pillText = shortPillLabel(node, nextManifest.domain);
-        const labelEl = document.createElement('div');
-        labelEl.className = `wo-node-pill wo-health-${node.health} wo-kind-${node.kind}`;
-        labelEl.dataset.nodeId = node.id;
-        labelEl.setAttribute('role', 'button');
-        labelEl.tabIndex = 0;
-        const dotEl = document.createElement('span');
-        dotEl.className = 'wo-pill-dot';
-        const txtEl = document.createElement('span');
-        txtEl.className = 'wo-pill-label';
-        txtEl.textContent = pillText;
-        labelEl.append(dotEl, txtEl);
-
-        if (node.health === 'orphan' || node.health === 'broken' || node.health === 'unlisted') {
-          const badgeEl = document.createElement('span');
-          badgeEl.className = 'wo-pill-badge';
-          badgeEl.textContent =
-            node.health === 'broken'
-              ? String(node.statusCode || 404)
-              : node.health === 'orphan'
-                ? 'orphan'
-                : 'unlisted';
-          labelEl.appendChild(badgeEl);
-        }
-        labelEl.setAttribute('aria-label', `${labelEl.textContent}. Inspect ${node.title}`);
-
-        labelEl.addEventListener('pointerenter', () => {
-          callbacksRef.current.onHoverNode(node.id);
-        });
-        labelEl.addEventListener('pointerleave', () => {
-          callbacksRef.current.onHoverNode(null);
-        });
-        labelEl.addEventListener('click', (ev) => {
-          ev.stopPropagation();
-          selectFromMap(node.id);
-        });
-        labelEl.addEventListener('focus', () => callbacksRef.current.onHoverNode(node.id));
-        labelEl.addEventListener('blur', () => callbacksRef.current.onHoverNode(null));
-        labelEl.addEventListener('keydown', (event) => {
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            event.stopPropagation();
-            selectFromMap(node.id);
-          }
-        });
-        labelEl.addEventListener('dblclick', (ev) => {
-          ev.stopPropagation();
-          selectFromMap(node.id);
-          callbacksRef.current.onOpenNoteNode?.(node);
-        });
-
-        const cssObj = new CSS2DObject(labelEl);
-        cssObj.position.set(0, (badge ? baseRadius * (BADGE_SCALE / 2) : baseRadius) + 0.16, 0);
-        group.add(cssObj);
-        nodesRoot.add(group);
-
-        runtimeNodes.set(node.id, {
+        const entry: RuntimeNodeEntry = {
           node,
-          group,
-          coreMesh,
-          haloMesh,
-          coreMat,
-          haloMat,
-          cssObj,
-          labelEl,
+          index,
+          baseRadius,
+          haloScale: baseRadius,
+          visible: true,
+          bucket: -1,
+          colorHex: -1,
+          haloAlpha: -1,
+          haloHex: -1,
+          posDirty: true,
           currentPos: new THREE.Vector3(...initPos),
           targetPos: new THREE.Vector3(...initPos),
-          pillMeasured: false,
+          pillText,
           pillW: Math.max(68, pillText.length * 7.2 + 28),
           pillH: 24,
-          badge,
-        });
-      }
+          pillMeasured: false,
+          labelOffsetY: baseRadius + 0.16,
+          label: null,
+        };
+
+        if (node.kind === 'home') {
+          const group = new THREE.Group();
+          group.position.set(initPos[0], initPos[1], initPos[2]);
+          const coreMat = new THREE.MeshStandardMaterial({
+            color: hex,
+            emissive: hex,
+            emissiveIntensity: 0.55,
+            roughness: 0.28,
+            metalness: 0.18,
+          });
+          const coreMesh = new THREE.Mesh(homeSphereGeom, coreMat);
+          coreMesh.scale.setScalar(baseRadius);
+          coreMesh.userData = { nodeId: node.id };
+          group.add(coreMesh);
+          homeTargets.push(coreMesh);
+
+          // The home node shows the site's own mark. The sphere stays as an invisible depth occluder
+          // and click target, so links still end at the centre and picking is unchanged.
+          let badge: BrandBadgeRuntime | undefined;
+          const mark = pickBrandMark(nextManifest);
+          if (mark) {
+            const canvas = document.createElement('canvas');
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.anisotropy = 4;
+            // Drawn last and without a depth test, so pages in front never hide the site's mark.
+            const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false, depthTest: false });
+            const sprite = new THREE.Sprite(material);
+            sprite.scale.setScalar(baseRadius * BADGE_SCALE);
+            sprite.renderOrder = 10;
+            group.add(sprite);
+            entry.haloScale = baseRadius * (BADGE_SCALE / 2) * 0.82;
+            coreMat.colorWrite = false;
+            // The invisible sphere is the click target, so it grows to the badge's full size, rim included.
+            coreMesh.scale.setScalar(baseRadius * (BADGE_SCALE / 2));
+            badge = { mark, canvas, texture, material, sprite, logo: null, theme: null, ringHex: hex, disposed: false };
+            const reader = assetReaderRef.current;
+            if (reader && mark.logoCandidates.length > 0) {
+              const target = badge;
+              void (async () => {
+                // First candidate that decodes and actually paints something; otherwise keep the initials.
+                for (const candidate of mark.logoCandidates) {
+                  try {
+                    const bytes = await reader(candidate.path);
+                    if (target.disposed) return;
+                    if (!bytes) continue;
+                    const img = await decodeLogo(bytes, candidate.path);
+                    if (target.disposed) return;
+                    if (!img) continue;
+                    const tone = analyseLogo(img);
+                    if (tone.coverage < MIN_LOGO_COVERAGE) continue;
+                    target.logo = { img, tone };
+                    target.theme = null; // redraw on the next frame
+                    renderVersionRef.current += 1;
+                    return;
+                  } catch {
+                    // Try the next candidate.
+                  }
+                }
+              })();
+            }
+          }
+          nodesRoot.add(group);
+          entry.home = { group, coreMesh, coreMat };
+          entry.badge = badge;
+          entry.labelOffsetY = (badge ? baseRadius * (BADGE_SCALE / 2) : baseRadius) + 0.16;
+        }
+
+        byIndex.push(entry);
+        runtimeNodes.set(node.id, entry);
+      });
+
+      nodeInst = { coreGeom, buckets, mats, halo, haloCenter, haloColor, haloSize, byIndex };
+      pickTargets = [...homeTargets, ...buckets];
 
       if (nextManifest.edges.length > pulseCapacity) {
         edgesRoot.remove(pulseInstanced);
@@ -1061,9 +1270,13 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
-      const visible = pickableMeshes.filter((m) => m.parent?.visible);
-      const hits = raycaster.intersectObjects(visible, false);
-      return hits.length > 0 ? (hits[0].object.userData?.nodeId as string) ?? null : null;
+      // Hidden node instances sit far from the scene and the home sphere is skipped while filtered out.
+      const targets = pickTargets.filter((object) => object.parent?.visible !== false);
+      const hits = raycaster.intersectObjects(targets, false);
+      if (hits.length === 0) return null;
+      const hit = hits[0];
+      if (hit.instanceId !== undefined) return nodeInst?.byIndex[hit.instanceId]?.node.id ?? null;
+      return (hit.object.userData?.nodeId as string) ?? null;
     };
 
     const onLabelOver = (ev: MouseEvent) => {
@@ -1195,96 +1408,13 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       }
     };
 
-    const animate = () => {
-      if (disposed) return;
-      rafId = window.requestAnimationFrame(animate);
-      if (pausedRef.current) return;
+    const tmpScale = new THREE.Vector3();
+    const identityQuat = new THREE.Quaternion();
 
-      const dt = Math.min(0.05, clock.getDelta());
-      const elapsed = clock.elapsedTime;
-      const st = stateRef.current;
-      const isDark = st.theme === 'dark';
-      const palette = isDark ? HEALTH_COLORS_DARK : HEALTH_COLORS_LIGHT;
-
-      const spinningNow = (!st.manifest || st.autoRotate) && st.viewMode === 'globe' && !st.selectedId && !st.hoveredId;
-      if (spinningNow) {
-        sceneSpinGroup.rotation.y += dt * (st.manifest ? 0.08 : 0.14);
-      } else if (st.viewMode !== 'globe') {
-        sceneSpinGroup.rotation.y = THREE.MathUtils.lerp(sceneSpinGroup.rotation.y, 0, 0.14);
-        if (Math.abs(sceneSpinGroup.rotation.y) < 1e-4) sceneSpinGroup.rotation.y = 0;
-      }
-      const settlingSpin = st.viewMode !== 'globe' && sceneSpinGroup.rotation.y !== 0;
-
-      // Smooth camera fly-to
-      const flying = cameraFlyRef.current.active;
-      if (cameraFlyRef.current.active) {
-        if (cameraFlyRef.current.instant) {
-          camera.position.copy(cameraFlyRef.current.camTarget);
-          controls.target.copy(cameraFlyRef.current.lookTarget);
-        } else {
-          camera.position.lerp(cameraFlyRef.current.camTarget, 0.11);
-          controls.target.lerp(cameraFlyRef.current.lookTarget, 0.13);
-        }
-        if (
-          camera.position.distanceTo(cameraFlyRef.current.camTarget) < 0.04 &&
-          controls.target.distanceTo(cameraFlyRef.current.lookTarget) < 0.04
-        ) {
-          cameraFlyRef.current.active = false;
-        }
-      }
-
-      controls.update();
-
-      // On-demand rendering: skip the heavy node, label and edge work unless something changed.
-      const camMoved = !camera.position.equals(lastCamPos) || !camera.quaternion.equals(lastCamQuat);
-      const key = [
-        st.viewMode, st.theme, st.selectedId ?? '', st.hoveredId ?? '', labelHoverId ?? '', st.filter, st.searchQuery,
-        st.showExternal, st.showChromeLinks, st.showAllLinks, st.showPulses, st.autoRotate,
-      ].join('|');
-      const keyChanged = key !== lastKey || st.manifest !== lastManifestRef || st.layouts !== lastLayoutsRef ||
-        renderVersionRef.current !== lastVersion;
-      const heavy = forceHeavy || keyChanged || camMoved || spinningNow || settlingSpin || flying || !nodesSettled || Boolean(gizmoHolderRef.current?.current && gizmoHolderRef.current.current !== syncedGizmo);
-      if (!heavy) {
-        if (st.showPulses && pulseEdges.length > 0) {
-          for (const re of pulseEdges) writePulse(re, elapsed, re.pulseHighlighted);
-          pulseInstanced.instanceMatrix.needsUpdate = true;
-          renderer.render(scene, camera);
-        }
-        return;
-      }
-      const measureLabels = keyChanged || forceHeavy;
-      forceHeavy = false;
-      lastKey = key;
-      lastManifestRef = st.manifest;
-      lastLayoutsRef = st.layouts;
-      lastVersion = renderVersionRef.current;
-      lastCamPos.copy(camera.position);
-      lastCamQuat.copy(camera.quaternion);
-      pulseEdges = [];
-      const gizmo = gizmoHolderRef.current?.current;
-      if (gizmo && (camMoved || gizmo !== syncedGizmo)) {
-        gizmo.updateCameraQuaternion(camera.quaternion);
-        syncedGizmo = gizmo;
-      }
-
-      // Update wireframe theme tint
-      primaryWireMat.color.setHex(isDark ? 0xa882ff : 0x7c3aed);
-      primaryWireMat.opacity = st.manifest ? (isDark ? 0.11 : 0.12) : 0.3;
-      secondaryWireMat.color.setHex(isDark ? 0x666666 : 0xb3b3b3);
-      secondaryWireMat.opacity = isDark ? 0.065 : 0.09;
-      externalOrbitMat.color.setHex(isDark ? 0xc2a9de : 0x7358a6);
-      externalOrbitMat.opacity = st.showExternal ? (isDark ? 0.2 : 0.18) : 0.04;
-      pulseMat.color.setHex(isDark ? 0xcbb3ff : 0x7c3aed);
-
-      globeFrameGroup.visible = st.viewMode === 'globe';
-      roadFrameGroup.visible = st.viewMode === 'road' && Boolean(st.manifest);
-
-      if (!st.manifest || !st.layouts) {
-        renderer.render(scene, camera);
-        labelRenderer.render(scene, camera);
-        return;
-      }
-
+    // How nodes look and which of them get a label: the mesh that draws each node, its colour and halo, and the
+    // capped, priority-ordered label candidates. Runs only when something that affects a node changed.
+    const syncNodes = (st: typeof stateRef.current, palette: Record<NodeHealth, number>) => {
+      const layouts = st.layouts!;
       const hoverId = labelHoverId ?? st.hoveredId;
       const focusId = hoverId ?? st.selectedId;
       labelRenderer.domElement.classList.toggle('is-hovering-node', hoverId !== null);
@@ -1302,10 +1432,10 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       const query = st.searchQuery.trim().toLowerCase();
       const targetMap =
         st.viewMode === 'road'
-          ? st.layouts.road
+          ? layouts.road
           : st.viewMode === 'clusters'
-            ? st.layouts.clusters
-            : st.layouts.globe;
+            ? layouts.clusters
+            : layouts.globe;
 
       // Resting label set, recomputed only when the manifest, filter or external toggle changes.
       const restingKey = `${st.filter}|${st.showExternal}`;
@@ -1319,61 +1449,92 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       }
       const resting = restingCache.ids;
 
-      // Update nodes
-      const visibleEntries: Array<{ entry: RuntimeNodeEntry; priority: number }> = [];
-
+      const inst = nodeInst;
+      let matrixDirty = false;
+      let colorDirty = false;
+      let haloDirty = false;
       let anyNodeMoving = false;
+      const candidates: LabelCandidate[] = [];
+
       runtimeNodes.forEach((entry, id) => {
         const tgt = targetMap.get(id) ?? [0, 0, 0];
         entry.targetPos.set(tgt[0], tgt[1], tgt[2]);
         entry.currentPos.lerp(entry.targetPos, 0.14);
-        if (entry.currentPos.distanceToSquared(entry.targetPos) > 1e-6) anyNodeMoving = true;
+        const moving = entry.currentPos.distanceToSquared(entry.targetPos) > 1e-6;
+        if (moving) anyNodeMoving = true;
         else entry.currentPos.copy(entry.targetPos);
-        entry.group.position.copy(entry.currentPos);
-        entry.haloMesh.quaternion.copy(camera.quaternion);
         if (entry.badge) syncBadge(entry.badge, st.theme);
 
         const allowedByFilter = matchesFilter(entry.node, st.filter, st.showExternal, st.attention);
+        entry.visible = allowedByFilter;
         const matchesQuery =
           !query ||
           entry.node.title.toLowerCase().includes(query) ||
           entry.node.path.toLowerCase().includes(query) ||
           entry.node.url.toLowerCase().includes(query);
-
-        entry.group.visible = allowedByFilter;
-        if (!allowedByFilter) {
-          entry.labelEl.classList.add('is-hidden');
-          return;
-        }
-
         const hex = palette[entry.node.health] ?? palette.healthy;
-        entry.coreMat.color.setHex(hex);
-        entry.coreMat.emissive.setHex(hex);
-        entry.haloMat.color.setHex(entry.badge ? entry.badge.ringHex : hex);
-
         const isDirect = id === focusId;
-        entry.labelEl.setAttribute('aria-pressed', String(id === st.selectedId));
         const isNeighbor = focusId ? connectedIds.has(id) : true;
         const dimmed = entry.node.kind !== 'home' && ((Boolean(focusId) && !isNeighbor) || (Boolean(query) && !matchesQuery));
 
-        entry.coreMat.opacity = dimmed ? 0.22 : 1;
-        entry.coreMat.transparent = dimmed;
-        entry.coreMat.emissiveIntensity = isDirect ? 0.85 : dimmed ? 0.08 : 0.32;
-        entry.haloMat.opacity = isDirect ? 0.85 : dimmed ? 0.05 : 0.28;
+        const home = entry.home;
+        if (home) {
+          home.group.position.copy(entry.currentPos);
+          home.group.visible = allowedByFilter;
+          if (allowedByFilter) {
+            home.coreMat.color.setHex(hex);
+            home.coreMat.emissive.setHex(hex);
+            home.coreMat.opacity = 1;
+            home.coreMat.transparent = false;
+            home.coreMat.emissiveIntensity = isDirect ? 0.85 : 0.32;
+          }
+        }
 
-        entry.labelEl.classList.toggle('is-active', isDirect);
-        entry.labelEl.classList.toggle('is-hover-target', id === hoverId);
-        entry.labelEl.classList.toggle('is-hover-context', isNeighbor);
-        entry.labelEl.classList.toggle('is-dimmed', dimmed);
-        entry.labelEl.style.translate = '';
-        if (hoverId && !isNeighbor) {
-          entry.labelEl.classList.add('is-hidden');
+        if (inst) {
+          const needsWrite = moving || entry.posDirty;
+          entry.posDirty = moving;
+          if (!home) {
+            const bucket = !allowedByFilter ? -1 : isDirect ? 2 : dimmed ? 1 : 0;
+            if (hex !== entry.colorHex) {
+              entry.colorHex = hex;
+              tmpColorA.setHex(hex);
+              for (const mesh of inst.buckets) mesh.setColorAt(entry.index, tmpColorA);
+              colorDirty = true;
+            }
+            if (bucket !== entry.bucket || (needsWrite && bucket >= 0)) {
+              if (bucket >= 0) {
+                tmpMat4.compose(entry.currentPos, identityQuat, tmpScale.setScalar(entry.baseRadius));
+              }
+              if (bucket !== entry.bucket) {
+                for (let b = 0; b < 3; b++) inst.buckets[b].setMatrixAt(entry.index, b === bucket ? tmpMat4 : hiddenInstanceMat);
+              } else {
+                inst.buckets[bucket].setMatrixAt(entry.index, tmpMat4);
+              }
+              entry.bucket = bucket;
+              matrixDirty = true;
+            }
+          }
+          const haloAlpha = !allowedByFilter ? 0 : isDirect ? 0.85 : dimmed ? 0.05 : 0.28;
+          const haloHex = entry.badge ? entry.badge.ringHex : hex;
+          if (needsWrite || haloAlpha !== entry.haloAlpha || haloHex !== entry.haloHex) {
+            tmpColorB.setHex(haloHex);
+            inst.haloCenter.setXYZ(entry.index, entry.currentPos.x, entry.currentPos.y, entry.currentPos.z);
+            inst.haloSize.setX(entry.index, entry.haloScale * HALO_PAD);
+            inst.haloColor.setXYZW(entry.index, tmpColorB.r, tmpColorB.g, tmpColorB.b, haloAlpha);
+            entry.haloAlpha = haloAlpha;
+            entry.haloHex = haloHex;
+            haloDirty = true;
+          }
+        }
+
+        // Label candidates: only a few labels at rest; hover, selection, neighbours and search add the rest.
+        if (!allowedByFilter || (hoverId && !isNeighbor)) {
+          unbindLabel(entry);
           return;
         }
-        // Only a few labels at rest; hover, selection, neighbours and search add the rest.
         const linked = Boolean(focusId) && connectedIds.has(id);
         if (!(isDirect || id === hoverId || id === st.selectedId || linked || (query && matchesQuery) || resting.has(id))) {
-          entry.labelEl.classList.add('is-hidden');
+          unbindLabel(entry);
           return;
         }
 
@@ -1387,13 +1548,47 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         else if (entry.node.kind === 'external-domain') priority = 25;
         else priority = 35 + Math.min(12, (entry.node.authorityScore ?? entry.node.inlinksBody * 4) / 8);
 
-        visibleEntries.push({ entry, priority });
+        candidates.push({ entry, priority, isDirect, isHoverTarget: id === hoverId, isNeighbor, dimmed });
       });
 
       nodesSettled = !anyNodeMoving;
+      if (inst) {
+        if (matrixDirty) for (const mesh of inst.buckets) mesh.instanceMatrix.needsUpdate = true;
+        if (colorDirty) for (const mesh of inst.buckets) if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+        if (haloDirty) {
+          inst.haloCenter.needsUpdate = true;
+          inst.haloSize.needsUpdate = true;
+          inst.haloColor.needsUpdate = true;
+        }
+      }
 
-      // Screen-space collision-free pill placement
-      visibleEntries.sort((a, b) => b.priority - a.priority);
+      // More labels than a screen can hold without overlap would only cost DOM; keep the highest priority ones.
+      candidates.sort((a, b) => b.priority - a.priority);
+      for (let i = MAX_LABEL_CANDIDATES; i < candidates.length; i++) unbindLabel(candidates[i].entry);
+      if (candidates.length > MAX_LABEL_CANDIDATES) candidates.length = MAX_LABEL_CANDIDATES;
+
+      for (const candidate of candidates) {
+        const { entry } = candidate;
+        if (!entry.label) bindLabel(entry);
+        const slot = entry.label!;
+        slot.obj.position.set(entry.currentPos.x, entry.currentPos.y + entry.labelOffsetY, entry.currentPos.z);
+        const el = slot.el;
+        el.setAttribute('aria-pressed', String(entry.node.id === st.selectedId));
+        el.classList.toggle('is-active', candidate.isDirect);
+        el.classList.toggle('is-hover-target', candidate.isHoverTarget);
+        el.classList.toggle('is-hover-context', candidate.isNeighbor);
+        el.classList.toggle('is-dimmed', candidate.dimmed);
+        el.style.translate = '';
+      }
+
+      labelCtx = { candidates, focusId, hoverId, connectedIds };
+    };
+
+    // Screen-space collision-free label placement. Cheap enough to run on every camera or spin frame: it only
+    // touches the capped candidate list that syncNodes chose.
+    const placeLabels = (st: typeof stateRef.current, measureLabels: boolean) => {
+      const { candidates: visibleEntries, focusId, hoverId, connectedIds } = labelCtx;
+      sceneSpinGroup.updateWorldMatrix(true, false);
       const placedBoxes: ScreenBox[] = [];
       placedBoxes.push({ l: 0, r: stageW, t: 0, b: 12 });
       // Keep labels clear of the discovery chip (top left) and the legend (bottom left).
@@ -1439,8 +1634,8 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         let sizeChanged = false;
         for (const { entry } of visibleEntries) {
           if (!measureLabels && entry.pillMeasured) continue;
-          const measuredW = entry.labelEl.offsetWidth;
-          const measuredH = entry.labelEl.offsetHeight;
+          const measuredW = entry.label!.el.offsetWidth;
+          const measuredH = entry.label!.el.offsetHeight;
           if (measuredW && measuredH) {
             if (Math.abs(measuredW - entry.pillW) > 0.5 || Math.abs(measuredH - entry.pillH) > 0.5) sizeChanged = true;
             entry.pillW = measuredW;
@@ -1451,16 +1646,16 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         const unmeasured = visibleEntries.some(({ entry }) => !entry.pillMeasured);
         measureAttempts = unmeasured ? measureAttempts + 1 : 0;
         // Bounded so a label that can never be measured cannot keep the loop awake forever.
-        if (sizeChanged || (unmeasured && measureAttempts < 30)) forceHeavy = true;
+        if (sizeChanged || (unmeasured && measureAttempts < 30)) forceLabels = true;
       }
 
       for (const { entry, priority } of visibleEntries) {
         // Section tags rank just below section hubs.
         if (priority < 58) placeSectorTags();
-        entry.cssObj.getWorldPosition(tmpWorldPos);
+        tmpWorldPos.set(entry.currentPos.x, entry.currentPos.y + entry.labelOffsetY, entry.currentPos.z).applyMatrix4(sceneSpinGroup.matrixWorld);
         tmpVec.copy(tmpWorldPos).project(camera);
         if (tmpVec.z > 1 || tmpVec.z < -1) {
-          entry.labelEl.classList.add('is-hidden');
+          entry.label!.el.classList.add('is-hidden');
           continue;
         }
         const sx = (tmpVec.x * 0.5 + 0.5) * stageW;
@@ -1477,7 +1672,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
 
         if (entry.node.id === focusId || (!focusId && entry.node.kind === 'home')) {
           placedBoxes.push(box);
-          entry.labelEl.classList.remove('is-hidden');
+          entry.label!.el.classList.remove('is-hidden');
           continue;
         }
 
@@ -1495,18 +1690,20 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
             candidate.b <= stageH - 8 && !placedBoxes.some((placed) => boxesOverlap(candidate, placed, 4));
         });
         if (!freeSlot) {
-          entry.labelEl.classList.add('is-hidden');
+          entry.label!.el.classList.add('is-hidden');
         } else {
           const [dx, dy] = freeSlot;
-          entry.labelEl.style.translate = `${dx}px ${dy}px`;
+          entry.label!.el.style.translate = `${dx}px ${dy}px`;
           placedBoxes.push({ l: box.l + dx, r: box.r + dx, t: box.t + dy, b: box.b + dy });
-          entry.labelEl.classList.remove('is-hidden');
+          entry.label!.el.classList.remove('is-hidden');
         }
       }
 
       placeSectorTags();
+    };
 
-      // Update curved 3D edges & calm, sparse directional micro-pulses
+    // Curves, colours and pulse flow for every edge. Runs only when something that affects an edge changed.
+    const syncEdges = (st: typeof stateRef.current, focusId: string | null, palette: Record<NodeHealth, number>, elapsed: number) => {
       const densityScale = Math.max(
         0.38,
         Math.min(1, Math.sqrt(85 / Math.max(85, runtimeEdges.size)))
@@ -1528,8 +1725,8 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
           srcEntry?.node.kind === 'home' ||
           (srcEntry?.node.kind === 'hub' && srcEntry.node.section === dstEntry?.node.section);
         const edgeAllowed =
-          Boolean(srcEntry?.group.visible) &&
-          Boolean(dstEntry?.group.visible) &&
+          Boolean(srcEntry?.visible) &&
+          Boolean(dstEntry?.visible) &&
           (re.edge.kind !== 'internal-chrome' || st.showChromeLinks) &&
           (re.edge.kind !== 'external' || st.showExternal) &&
           (st.showAllLinks || isDirectConnection || isStructural);
@@ -1650,6 +1847,114 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         if (edgeColDirty) eb.color.needsUpdate = true;
       }
       pulseInstanced.instanceMatrix.needsUpdate = true;
+    };
+
+
+
+    const animate = () => {
+      if (disposed) return;
+      rafId = window.requestAnimationFrame(animate);
+      if (pausedRef.current) return;
+
+      const dt = Math.min(0.05, clock.getDelta());
+      const elapsed = clock.elapsedTime;
+      const st = stateRef.current;
+      const isDark = st.theme === 'dark';
+      const palette = isDark ? HEALTH_COLORS_DARK : HEALTH_COLORS_LIGHT;
+
+      const spinningNow = (!st.manifest || st.autoRotate) && st.viewMode === 'globe' && !st.selectedId && !st.hoveredId;
+      if (spinningNow) {
+        sceneSpinGroup.rotation.y += dt * (st.manifest ? 0.08 : 0.14);
+      } else if (st.viewMode !== 'globe') {
+        sceneSpinGroup.rotation.y = THREE.MathUtils.lerp(sceneSpinGroup.rotation.y, 0, 0.14);
+        if (Math.abs(sceneSpinGroup.rotation.y) < 1e-4) sceneSpinGroup.rotation.y = 0;
+      }
+      const settlingSpin = st.viewMode !== 'globe' && sceneSpinGroup.rotation.y !== 0;
+
+      // Smooth camera fly-to
+      const flying = cameraFlyRef.current.active;
+      if (cameraFlyRef.current.active) {
+        if (cameraFlyRef.current.instant) {
+          camera.position.copy(cameraFlyRef.current.camTarget);
+          controls.target.copy(cameraFlyRef.current.lookTarget);
+        } else {
+          camera.position.lerp(cameraFlyRef.current.camTarget, 0.11);
+          controls.target.lerp(cameraFlyRef.current.lookTarget, 0.13);
+        }
+        if (
+          camera.position.distanceTo(cameraFlyRef.current.camTarget) < 0.04 &&
+          controls.target.distanceTo(cameraFlyRef.current.lookTarget) < 0.04
+        ) {
+          cameraFlyRef.current.active = false;
+        }
+      }
+
+      controls.update();
+      // On-demand rendering in two tiers. Scene state (node placement, colour, halo, edges, label choice) is
+      // rebuilt only when something that affects it changed. A frame that only moves the camera or spins the
+      // globe just re-places the labels, which is all that depends on the view.
+      const camMoved = !camera.position.equals(lastCamPos) || !camera.quaternion.equals(lastCamQuat);
+      const key = [
+        st.viewMode, st.theme, st.selectedId ?? '', st.hoveredId ?? '', labelHoverId ?? '', st.filter, st.searchQuery,
+        st.showExternal, st.showChromeLinks, st.showAllLinks, st.showPulses, st.autoRotate,
+      ].join('|');
+      const keyChanged = key !== lastKey || st.manifest !== lastManifestRef || st.layouts !== lastLayoutsRef ||
+        renderVersionRef.current !== lastVersion;
+      const gizmoPending = Boolean(gizmoHolderRef.current?.current && gizmoHolderRef.current.current !== syncedGizmo);
+      const stateDirty = forceHeavy || keyChanged || !nodesSettled;
+      const viewDirty = camMoved || spinningNow || settlingSpin || flying || gizmoPending;
+      if (!stateDirty && !viewDirty && !forceLabels) {
+        if (st.showPulses && pulseEdges.length > 0) {
+          for (const re of pulseEdges) writePulse(re, elapsed, re.pulseHighlighted);
+          pulseInstanced.instanceMatrix.needsUpdate = true;
+          renderer.render(scene, camera);
+        }
+        return;
+      }
+      const measureLabels = keyChanged || forceHeavy;
+      forceLabels = false;
+      if (stateDirty) {
+        forceHeavy = false;
+        lastKey = key;
+        lastManifestRef = st.manifest;
+        lastLayoutsRef = st.layouts;
+        lastVersion = renderVersionRef.current;
+        pulseEdges = [];
+      }
+      lastCamPos.copy(camera.position);
+      lastCamQuat.copy(camera.quaternion);
+      const gizmo = gizmoHolderRef.current?.current;
+      if (gizmo && (camMoved || gizmo !== syncedGizmo)) {
+        gizmo.updateCameraQuaternion(camera.quaternion);
+        syncedGizmo = gizmo;
+      }
+
+      // Update wireframe theme tint
+      primaryWireMat.color.setHex(isDark ? 0xa882ff : 0x7c3aed);
+      primaryWireMat.opacity = st.manifest ? (isDark ? 0.11 : 0.12) : 0.3;
+      secondaryWireMat.color.setHex(isDark ? 0x666666 : 0xb3b3b3);
+      secondaryWireMat.opacity = isDark ? 0.065 : 0.09;
+      externalOrbitMat.color.setHex(isDark ? 0xc2a9de : 0x7358a6);
+      externalOrbitMat.opacity = st.showExternal ? (isDark ? 0.2 : 0.18) : 0.04;
+      pulseMat.color.setHex(isDark ? 0xcbb3ff : 0x7c3aed);
+
+      globeFrameGroup.visible = st.viewMode === 'globe';
+      roadFrameGroup.visible = st.viewMode === 'road' && Boolean(st.manifest);
+
+      if (!st.manifest || !st.layouts) {
+        renderer.render(scene, camera);
+        labelRenderer.render(scene, camera);
+        return;
+      }
+
+      if (stateDirty) {
+        syncNodes(st, palette);
+        syncEdges(st, labelCtx.focusId, palette, elapsed);
+      } else if (st.showPulses && pulseEdges.length > 0) {
+        for (const re of pulseEdges) writePulse(re, elapsed, re.pulseHighlighted);
+        pulseInstanced.instanceMatrix.needsUpdate = true;
+      }
+      placeLabels(st, measureLabels);
 
       renderer.render(scene, camera);
       labelRenderer.render(scene, camera);
@@ -1674,6 +1979,10 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       renderer.domElement.removeEventListener('dblclick', onDblClick);
       renderer.domElement.removeEventListener('webglcontextlost', handleContextLost);
       clearRuntimeGraph();
+      for (const slot of labelPool) slot.el.remove();
+      labelPool.length = 0;
+      freeLabels.length = 0;
+      sceneSpinGroup.remove(labelsRoot);
       clearDynamicSectors();
       pulseInstanced.dispose();
       for (const d of disposables) d.dispose();
