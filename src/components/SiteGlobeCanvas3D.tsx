@@ -117,10 +117,16 @@ interface RuntimeNodeEntry {
   haloScale: number;
   /** Passed the filter on the last sync. */
   visible: boolean;
-  /** Which core mesh draws this node: 0 normal, 1 dimmed, 2 focused, -1 none. */
+  /** Which core mesh draws this node: 0 translucent, 1 opaque (fully opaque orbs draw first), -1 none. */
   bucket: number;
   colorHex: number;
+  /** Current and target style. Current values ease toward the targets; -1 means not yet initialised. */
+  opacity: number;
+  opacityTarget: number;
+  glow: number;
+  glowTarget: number;
   haloAlpha: number;
+  haloAlphaTarget: number;
   haloHex: number;
   /** True for the frame after a node stopped moving, so its final position is written once. */
   posDirty: boolean;
@@ -148,12 +154,18 @@ interface LabelCandidate {
   dimmed: boolean;
 }
 
-/** All non-home nodes share three instanced spheres and every halo is one instanced billboard. */
+/** All non-home nodes share two instanced spheres and every halo is one instanced billboard. */
 interface NodeInstancing {
   coreGeom: THREE.SphereGeometry;
-  /** [normal, dimmed, focused]: separate meshes because emissive strength and opacity are per material. */
+  /** [translucent, opaque]. Opacity and glow are per-instance attributes; the split only fixes draw order, so
+   *  fully opaque orbs are drawn first and translucent ones blend over them, never the other way round. */
   buckets: THREE.InstancedMesh[];
   mats: THREE.MeshStandardMaterial[];
+  opacity: THREE.InstancedBufferAttribute;
+  glow: THREE.InstancedBufferAttribute;
+  visuals: NodeVisualTuning;
+  /** Radii spanned by the halo quad (fits the ring at the configured thickness). */
+  haloPad: number;
   halo: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.ShaderMaterial>;
   haloCenter: THREE.InstancedBufferAttribute;
   haloColor: THREE.InstancedBufferAttribute;
@@ -175,8 +187,64 @@ const BADGE_SCALE = 2.8;
 const MAX_LABEL_CANDIDATES = 800;
 /** Matches the 0.18s opacity transition on .wo-node-pill. */
 const LABEL_FADE_MS = 220;
-/** The halo quad spans this many node radii; the ring itself runs from 1.32 to 1.65. */
+/** The halo quad spans this many node radii (the 1px ring sits inside it). */
 const HALO_PAD = 1.7;
+/** The original halo ring ran from 1.32 to 1.65 node radii; the hairline ring is centred on that band. */
+const ORIGINAL_RING_INNER = 1.32;
+const ORIGINAL_RING_OUTER = 1.65;
+
+/**
+ * How nodes look. Everything here can be changed without touching the renderer: set
+ * `window.__WO_VISUAL__ = { defaultOpacity: 0.8 }` before the map is built and the given fields override the
+ * defaults. That is how sphere detail, opacity and halo weight are tuned against frame rate.
+ */
+export interface NodeVisualTuning {
+  /** Sphere tessellation. Fixed by default so a node looks the same at every site size. */
+  sphereWidthSegments: number;
+  sphereHeightSegments: number;
+  /** When true, big sites use coarser spheres (14x10 above 400 nodes, 10x8 above 1200) to save GPU time. */
+  adaptiveSphereDetail: boolean;
+  /** Opacity of an orb at rest. */
+  defaultOpacity: number;
+  /** Opacity of the selected or hovered orb, the orbs linked to it, and search matches. */
+  highlightOpacity: number;
+  /** Opacity of every other orb while something is selected, hovered or searched. */
+  dimOpacity: number;
+  /** Time for an opacity change to settle, in milliseconds. */
+  transitionMs: number;
+  /** Emissive glow strength (the share of the orb's own colour added on top of its lighting). */
+  glowDefault: number;
+  glowSelected: number;
+  glowDim: number;
+  /** Halo ring opacity for the same three states. */
+  haloAlphaDefault: number;
+  haloAlphaSelected: number;
+  haloAlphaDim: number;
+  /** Halo ring width in screen pixels. It is a hairline at every zoom level, however large the orb. */
+  haloWidthPx: number;
+}
+
+export const DEFAULT_NODE_VISUALS: NodeVisualTuning = {
+  sphereWidthSegments: 22,
+  sphereHeightSegments: 22,
+  adaptiveSphereDetail: false,
+  defaultOpacity: 0.69,
+  highlightOpacity: 1,
+  dimOpacity: 0.2,
+  transitionMs: 240,
+  glowDefault: 0.32,
+  glowSelected: 0.85,
+  glowDim: 0.08,
+  haloAlphaDefault: 0.28,
+  haloAlphaSelected: 0.85,
+  haloAlphaDim: 0.05,
+  haloWidthPx: 1,
+};
+
+function resolveNodeVisuals(): NodeVisualTuning {
+  const override = (globalThis as { __WO_VISUAL__?: Partial<NodeVisualTuning> }).__WO_VISUAL__;
+  return { ...DEFAULT_NODE_VISUALS, ...(override ?? {}) };
+}
 
 interface BrandBadgeRuntime {
   mark: BrandMark;
@@ -885,7 +953,11 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
     let pulseInstanced = new THREE.InstancedMesh(pulseGeom, pulseMat, pulseCapacity);
     pulseInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     pulseInstanced.frustumCulled = false;
+    pulseInstanced.renderOrder = 4;
     edgesRoot.add(pulseInstanced);
+
+    // Orbs whose opacity, glow or halo is still easing toward its target.
+    const animatingNodes = new Set<RuntimeNodeEntry>();
 
     const disposeNodeInstancing = () => {
       if (!nodeInst) return;
@@ -915,6 +987,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         }
       });
       runtimeNodes.clear();
+      animatingNodes.clear();
       disposeNodeInstancing();
       labelCtx = emptyLabelContext();
 
@@ -986,36 +1059,52 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       // detail drops as the count rises: a few hundred triangles per node is invisible once there are thousands.
       const nodeCount = nextManifest.nodes.length;
       const capacity = Math.max(1, nodeCount);
-      const [widthSegs, heightSegs] = nodeCount > 1200 ? [10, 8] : nodeCount > 400 ? [14, 10] : [22, 22];
+      const visuals = resolveNodeVisuals();
+      const adaptive = visuals.adaptiveSphereDetail;
+      const [widthSegs, heightSegs] =
+        adaptive && nodeCount > 1200 ? [10, 8]
+        : adaptive && nodeCount > 400 ? [14, 10]
+        : [visuals.sphereWidthSegments, visuals.sphereHeightSegments];
       const coreGeom = new THREE.SphereGeometry(1, widthSegs, heightSegs);
-      // The instance colour is the node colour, and emissive follows it: the same glow as a per-node material.
-      const makeCoreMaterial = (emissiveIntensity: number, opacity: number) => {
+      // Opacity and glow are per orb, so any orb can fade independently of the others.
+      const opacityAttr = new THREE.InstancedBufferAttribute(new Float32Array(capacity).fill(visuals.defaultOpacity), 1);
+      const glowAttr = new THREE.InstancedBufferAttribute(new Float32Array(capacity).fill(visuals.glowDefault), 1);
+      opacityAttr.setUsage(THREE.DynamicDrawUsage);
+      glowAttr.setUsage(THREE.DynamicDrawUsage);
+      coreGeom.setAttribute('aOpacity', opacityAttr);
+      coreGeom.setAttribute('aGlow', glowAttr);
+      // The instance colour is the node colour from the palette, multiplied onto a white material. Emissive follows
+      // it (the orb's own colour times its glow), exactly as a per-node emissive material did.
+      const makeCoreMaterial = (transparent: boolean) => {
         const mat = new THREE.MeshStandardMaterial({
           color: 0xffffff,
           emissive: 0xffffff,
-          emissiveIntensity,
           roughness: 0.28,
           metalness: 0.18,
-          transparent: opacity < 1,
-          opacity,
-          depthWrite: opacity >= 1,
+          transparent,
+          depthWrite: !transparent,
         });
         mat.onBeforeCompile = (shader) => {
-          shader.fragmentShader = shader.fragmentShader.replace(
-            '#include <emissivemap_fragment>',
-            '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance *= diffuseColor.rgb;'
-          );
+          shader.vertexShader = shader.vertexShader
+            .replace('#include <common>', '#include <common>\nattribute float aOpacity;\nattribute float aGlow;\nvarying float vOpacity;\nvarying float vGlow;')
+            .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvOpacity = aOpacity;\n\tvGlow = aGlow;');
+          shader.fragmentShader = shader.fragmentShader
+            .replace('#include <common>', '#include <common>\nvarying float vOpacity;\nvarying float vGlow;')
+            .replace('#include <color_fragment>', '#include <color_fragment>\n\tdiffuseColor.a *= vOpacity;')
+            .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance = diffuseColor.rgb * vGlow;');
         };
-        mat.customProgramCacheKey = () => 'web-obs-instanced-emissive';
+        mat.customProgramCacheKey = () => 'web-obs-instanced-style';
         return mat;
       };
-      const mats = [makeCoreMaterial(0.32, 1), makeCoreMaterial(0.08, 0.22), makeCoreMaterial(0.85, 1)];
+      const mats = [makeCoreMaterial(true), makeCoreMaterial(false)];
       const white = new THREE.Color(1, 1, 1);
-      const buckets = mats.map((mat) => {
+      const buckets = mats.map((mat, bucketIndex) => {
         const mesh = new THREE.InstancedMesh(coreGeom, mat, capacity);
         mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
         mesh.count = nodeCount;
         mesh.frustumCulled = false;
+        // Edges, then halos, then translucent orbs, then pulse dots: a stable order among the transparent objects.
+        if (bucketIndex === 0) mesh.renderOrder = 3;
         for (let i = 0; i < capacity; i++) {
           mesh.setMatrixAt(i, hiddenInstanceMat);
           mesh.setColorAt(i, white);
@@ -1037,6 +1126,9 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       haloGeom.setAttribute('iColor', haloColor);
       haloGeom.setAttribute('iSize', haloSize);
       haloGeom.instanceCount = nodeCount;
+      // The ring keeps the original ring's centre radius; its width is set in screen pixels in the shader.
+      const haloPad = HALO_PAD;
+      const ringMid = ((ORIGINAL_RING_INNER + ORIGINAL_RING_OUTER) / 2) / haloPad;
       const haloMat = new THREE.ShaderMaterial({
         transparent: true,
         depthWrite: false,
@@ -1058,12 +1150,13 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
           varying vec2 vUv;
           varying vec4 vColor;
           void main() {
-            // The quad spans ${HALO_PAD} radii; the ring runs from 1.32 to 1.65 radii.
+            // The quad spans ${haloPad.toFixed(3)} radii. The ring is centred where the original ring was and is exactly
+            // haloWidthPx pixels wide (px is one pixel in these units), so it stays a hairline at every zoom.
             float r = length(vUv);
-            float aa = max(fwidth(r), 0.002);
-            float inner = ${(1.32 / HALO_PAD).toFixed(5)};
-            float outer = ${(1.65 / HALO_PAD).toFixed(5)};
-            float a = smoothstep(inner - aa, inner + aa, r) * (1.0 - smoothstep(outer - aa, outer + aa, r));
+            float px = max(fwidth(r), 0.0005);
+            float halfWidth = ${(visuals.haloWidthPx * 0.5).toFixed(3)} * px;
+            float d = abs(r - ${ringMid.toFixed(5)}) - halfWidth;
+            float a = 1.0 - smoothstep(-0.5 * px, 0.5 * px, d);
             if (a < 0.004) discard;
             gl_FragColor = vec4(vColor.rgb, vColor.a * a);
             #include <colorspace_fragment>
@@ -1071,6 +1164,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       });
       const halo = new THREE.Mesh(haloGeom, haloMat);
       halo.frustumCulled = false;
+      halo.renderOrder = 2;
       nodesRoot.add(halo);
 
       const byIndex: RuntimeNodeEntry[] = [];
@@ -1095,7 +1189,12 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
           visible: true,
           bucket: -1,
           colorHex: -1,
+          opacity: -1,
+          opacityTarget: -1,
+          glow: -1,
+          glowTarget: -1,
           haloAlpha: -1,
+          haloAlphaTarget: -1,
           haloHex: -1,
           posDirty: true,
           currentPos: new THREE.Vector3(...initPos),
@@ -1178,7 +1277,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         runtimeNodes.set(node.id, entry);
       });
 
-      nodeInst = { coreGeom, buckets, mats, halo, haloCenter, haloColor, haloSize, byIndex };
+      nodeInst = { coreGeom, buckets, mats, opacity: opacityAttr, glow: glowAttr, visuals, haloPad, halo, haloCenter, haloColor, haloSize, byIndex };
 
       if (nextManifest.edges.length > pulseCapacity) {
         edgesRoot.remove(pulseInstanced);
@@ -1187,6 +1286,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         pulseInstanced = new THREE.InstancedMesh(pulseGeom, pulseMat, pulseCapacity);
         pulseInstanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
         pulseInstanced.frustumCulled = false;
+    pulseInstanced.renderOrder = 4;
         edgesRoot.add(pulseInstanced);
       }
 
@@ -1245,6 +1345,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         const lines = new THREE.LineSegments(geom, mat);
         // Positions change every frame while nodes move, so a stale bounding sphere would cull the whole set.
         lines.frustumCulled = false;
+        lines.renderOrder = 1;
         edgesRoot.add(lines);
         edgeBuffers = { lines, segments, position, color };
       }
@@ -1446,6 +1547,53 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
     const tmpScale = new THREE.Vector3();
     const identityQuat = new THREE.Quaternion();
 
+    // Puts a node's instance matrix in the mesh that should draw it: opaque once fully opaque (those draw first),
+    // translucent otherwise. Returns true when a matrix was written.
+    const placeInstance = (entry: RuntimeNodeEntry, inst: NodeInstancing, forceWrite: boolean): boolean => {
+      if (entry.home) return false;
+      const bucket = !entry.visible ? -1 : entry.opacity >= 0.999 ? 1 : 0;
+      if (bucket === entry.bucket && (!forceWrite || bucket < 0)) return false;
+      if (bucket >= 0) tmpMat4.compose(entry.currentPos, identityQuat, tmpScale.setScalar(entry.baseRadius));
+      if (bucket !== entry.bucket) {
+        inst.buckets[0].setMatrixAt(entry.index, bucket === 0 ? tmpMat4 : hiddenInstanceMat);
+        inst.buckets[1].setMatrixAt(entry.index, bucket === 1 ? tmpMat4 : hiddenInstanceMat);
+      } else {
+        inst.buckets[bucket].setMatrixAt(entry.index, tmpMat4);
+      }
+      entry.bucket = bucket;
+      return true;
+    };
+
+    const approach = (current: number, target: number, rate: number) => {
+      const delta = target - current;
+      return Math.abs(delta) < 0.004 ? target : current + delta * rate;
+    };
+
+    // Eases every animating orb toward its target opacity, glow and halo, so selecting or hovering fades the map
+    // instead of snapping it. Cheap: only orbs that are still moving are touched.
+    const stepStyles = (dt: number) => {
+      const inst = nodeInst;
+      if (!inst || animatingNodes.size === 0) return;
+      const rate = 1 - Math.exp(-dt / Math.max(0.001, inst.visuals.transitionMs / 3000));
+      let matrixDirty = false;
+      for (const entry of animatingNodes) {
+        entry.opacity = approach(entry.opacity, entry.opacityTarget, rate);
+        entry.glow = approach(entry.glow, entry.glowTarget, rate);
+        entry.haloAlpha = approach(entry.haloAlpha, entry.haloAlphaTarget, rate);
+        inst.opacity.setX(entry.index, entry.opacity);
+        inst.glow.setX(entry.index, entry.glow);
+        inst.haloColor.setW(entry.index, entry.haloAlpha);
+        if (placeInstance(entry, inst, false)) matrixDirty = true;
+        if (entry.opacity === entry.opacityTarget && entry.glow === entry.glowTarget && entry.haloAlpha === entry.haloAlphaTarget) {
+          animatingNodes.delete(entry);
+        }
+      }
+      inst.opacity.needsUpdate = true;
+      inst.glow.needsUpdate = true;
+      inst.haloColor.needsUpdate = true;
+      if (matrixDirty) for (const mesh of inst.buckets) mesh.instanceMatrix.needsUpdate = true;
+    };
+
     // How nodes look and which of them get a label: the mesh that draws each node, its colour and halo, and the
     // capped, priority-ordered label candidates. Runs only when something that affects a node changed.
     const syncNodes = (st: typeof stateRef.current, palette: Record<NodeHealth, number>) => {
@@ -1528,35 +1676,43 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         if (inst) {
           const needsWrite = moving || entry.posDirty;
           entry.posDirty = moving;
+          const v = inst.visuals;
+          // Something is selected, hovered or searched: linked orbs and matches light up, the rest recede.
+          const focusing = Boolean(focusId) || Boolean(query);
+          const targetOpacity = dimmed ? v.dimOpacity : focusing ? v.highlightOpacity : v.defaultOpacity;
+          const targetGlow = isDirect ? v.glowSelected : dimmed ? v.glowDim : v.glowDefault;
+          const targetHalo = !allowedByFilter ? 0 : isDirect ? v.haloAlphaSelected : dimmed ? v.haloAlphaDim : v.haloAlphaDefault;
+          const haloHex = entry.badge ? entry.badge.ringHex : hex;
+          let snapped = false;
+          if (entry.opacity < 0 || !allowedByFilter) {
+            snapped = true;
+            // First sync, or hidden by a filter: set directly, nothing to animate.
+            entry.opacity = entry.opacityTarget = targetOpacity;
+            entry.glow = entry.glowTarget = targetGlow;
+            entry.haloAlpha = entry.haloAlphaTarget = targetHalo;
+            inst.opacity.setX(entry.index, targetOpacity);
+            inst.glow.setX(entry.index, targetGlow);
+            animatingNodes.delete(entry);
+          } else if (targetOpacity !== entry.opacityTarget || targetGlow !== entry.glowTarget || targetHalo !== entry.haloAlphaTarget) {
+            entry.opacityTarget = targetOpacity;
+            entry.glowTarget = targetGlow;
+            entry.haloAlphaTarget = targetHalo;
+            animatingNodes.add(entry);
+          }
           if (!home) {
-            const bucket = !allowedByFilter ? -1 : isDirect ? 2 : dimmed ? 1 : 0;
             if (hex !== entry.colorHex) {
               entry.colorHex = hex;
               tmpColorA.setHex(hex);
               for (const mesh of inst.buckets) mesh.setColorAt(entry.index, tmpColorA);
               colorDirty = true;
             }
-            if (bucket !== entry.bucket || (needsWrite && bucket >= 0)) {
-              if (bucket >= 0) {
-                tmpMat4.compose(entry.currentPos, identityQuat, tmpScale.setScalar(entry.baseRadius));
-              }
-              if (bucket !== entry.bucket) {
-                for (let b = 0; b < 3; b++) inst.buckets[b].setMatrixAt(entry.index, b === bucket ? tmpMat4 : hiddenInstanceMat);
-              } else {
-                inst.buckets[bucket].setMatrixAt(entry.index, tmpMat4);
-              }
-              entry.bucket = bucket;
-              matrixDirty = true;
-            }
+            if (placeInstance(entry, inst, needsWrite)) matrixDirty = true;
           }
-          const haloAlpha = !allowedByFilter ? 0 : isDirect ? 0.85 : dimmed ? 0.05 : 0.28;
-          const haloHex = entry.badge ? entry.badge.ringHex : hex;
-          if (needsWrite || haloAlpha !== entry.haloAlpha || haloHex !== entry.haloHex) {
+          if (needsWrite || snapped || haloHex !== entry.haloHex) {
             tmpColorB.setHex(haloHex);
             inst.haloCenter.setXYZ(entry.index, entry.currentPos.x, entry.currentPos.y, entry.currentPos.z);
-            inst.haloSize.setX(entry.index, entry.haloScale * HALO_PAD);
-            inst.haloColor.setXYZW(entry.index, tmpColorB.r, tmpColorB.g, tmpColorB.b, haloAlpha);
-            entry.haloAlpha = haloAlpha;
+            inst.haloSize.setX(entry.index, entry.haloScale * inst.haloPad);
+            inst.haloColor.setXYZW(entry.index, tmpColorB.r, tmpColorB.g, tmpColorB.b, entry.haloAlpha);
             entry.haloHex = haloHex;
             haloDirty = true;
           }
@@ -1589,6 +1745,8 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       nodesSettled = !anyNodeMoving;
       if (inst) {
         if (matrixDirty) for (const mesh of inst.buckets) mesh.instanceMatrix.needsUpdate = true;
+        inst.opacity.needsUpdate = true;
+        inst.glow.needsUpdate = true;
         if (colorDirty) for (const mesh of inst.buckets) if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
         if (haloDirty) {
           inst.haloCenter.needsUpdate = true;
@@ -1937,11 +2095,16 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         renderVersionRef.current !== lastVersion;
       const gizmoPending = Boolean(gizmoHolderRef.current?.current && gizmoHolderRef.current.current !== syncedGizmo);
       const stateDirty = forceHeavy || keyChanged || !nodesSettled;
+      const stylesAnimating = animatingNodes.size > 0;
       const viewDirty = camMoved || spinningNow || settlingSpin || flying || gizmoPending;
       if (!stateDirty && !viewDirty && !forceLabels) {
-        if (st.showPulses && pulseEdges.length > 0) {
-          for (const re of pulseEdges) writePulse(re, elapsed, re.pulseHighlighted);
-          pulseInstanced.instanceMatrix.needsUpdate = true;
+        // Nothing but orb opacity is easing (or only pulses move): the scene redraws, labels stay where they are.
+        if (stylesAnimating) stepStyles(dt);
+        if (stylesAnimating || (st.showPulses && pulseEdges.length > 0)) {
+          if (st.showPulses) {
+            for (const re of pulseEdges) writePulse(re, elapsed, re.pulseHighlighted);
+            pulseInstanced.instanceMatrix.needsUpdate = true;
+          }
           renderer.render(scene, camera);
         }
         return;
@@ -1989,6 +2152,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         for (const re of pulseEdges) writePulse(re, elapsed, re.pulseHighlighted);
         pulseInstanced.instanceMatrix.needsUpdate = true;
       }
+      stepStyles(dt);
       placeLabels(st, measureLabels);
 
       renderer.render(scene, camera);
