@@ -205,7 +205,7 @@ const ROAD_VIEW_DIRECTION = new THREE.Vector3(0, 0.05, 1).normalize();
  * Camera position that frames every point in the stage, looking along `direction`.
  * Leaves room for labels above nodes and for the discovery chip and legend in the corners.
  */
-export function fitCameraToPoints(points: readonly THREE.Vector3[], direction: THREE.Vector3, fovDeg: number, stageW: number, stageH: number) {
+export function fitCameraToPoints(points: readonly THREE.Vector3[], direction: THREE.Vector3, fovDeg: number, stageW: number, stageH: number, pad: { x: number; y: number } = { x: 0.9, y: 0.8 }) {
   const d = direction.clone().normalize();
   const forward = d.clone().negate();
   const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0));
@@ -228,11 +228,13 @@ export function fitCameraToPoints(points: readonly THREE.Vector3[], direction: T
   let distance = 6;
   for (const [x, y, z] of projected) {
     const depth = z - cz;
-    distance = Math.max(distance, depth + (Math.abs(x - cx) + 0.9) / tanH, depth + (Math.abs(y - cy) + 0.8) / tanV);
+    distance = Math.max(distance, depth + (Math.abs(x - cx) + pad.x) / tanH, depth + (Math.abs(y - cy) + pad.y) / tanV);
   }
-  distance = Math.min(40, distance);
+  // No fixed cap: a wide Road strip or a large Clusters layout needs the camera farther out.
   const center = right.multiplyScalar(cx).add(up.multiplyScalar(cy)).add(d.clone().multiplyScalar(cz));
-  return { lookTarget: center, camTarget: center.clone().addScaledVector(d, distance) };
+  let radius = 0;
+  for (const p of points) radius = Math.max(radius, p.distanceTo(center));
+  return { lookTarget: center, camTarget: center.clone().addScaledVector(d, distance), distance, radius };
 }
 
 function shortPillLabel(node: SiteNode, domain?: string): string {
@@ -587,19 +589,20 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
     const buildRoadFrame = (curLayouts: ComputedSiteLayouts, domain: string) => {
       clearRoadFrame();
       const columns = curLayouts.roadColumns;
-      const top = Math.max(1, ...columns.map((column) => column.top));
+      const step = curLayouts.roadMetrics.rowStep;
+      const top = Math.max(step, ...columns.map((column) => column.top));
       const pts: THREE.Vector3[] = [];
       columns.forEach((column, index) => {
         if (index > 0) {
           const x = (columns[index - 1].right + column.left) / 2;
-          pts.push(new THREE.Vector3(x, -top - 0.5, 0), new THREE.Vector3(x, top + 0.5, 0));
+          pts.push(new THREE.Vector3(x, -top - step * 0.5, 0), new THREE.Vector3(x, top + step * 0.5, 0));
         }
         const el = document.createElement('div');
         el.className = 'wo-sector-tag wo-road-tag';
         el.dataset.columnId = column.id;
         el.textContent = column.id === 'home' ? domain || column.title : `${column.title} · ${column.count}`;
         const obj = new CSS2DObject(el);
-        obj.position.set(column.x, top + 1.05, 0);
+        obj.position.set(column.x, top + step * 1.1, 0);
         roadFrameGroup.add(obj);
         roadTags.push(obj);
       });
@@ -649,8 +652,9 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         if (coordinates) points.push(new THREE.Vector3(...coordinates));
       }
       if (mode === 'road') {
-        const top = Math.max(1, ...curLayouts.roadColumns.map((column) => column.top));
-        points.push(new THREE.Vector3(0, top + 1.05, 0));
+        const step = curLayouts.roadMetrics.rowStep;
+        const top = Math.max(step, ...curLayouts.roadColumns.map((column) => column.top));
+        points.push(new THREE.Vector3(0, top + step * 1.1, 0));
       } else if (mode === 'globe') {
         // Frame the globe wireframe, not just the nodes on it.
         const r = GLOBE_SURFACE_RADIUS;
@@ -658,8 +662,16 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
           new THREE.Vector3(0, -r, 0), new THREE.Vector3(0, 0, r), new THREE.Vector3(0, 0, -r));
       }
       if (!points.length) return;
-      const fit = fitCameraToPoints(points, mode === 'road' ? ROAD_VIEW_DIRECTION : GLOBE_VIEW_DIRECTION, camera.fov, stageW, stageH);
-      cameraFlyRef.current = { active: true, ...fit };
+      // Road padding follows the layout's own row step, so it stays proportional to node and label spacing.
+      const roadStep = curLayouts.roadMetrics.rowStep;
+      const fit = fitCameraToPoints(points, mode === 'road' ? ROAD_VIEW_DIRECTION : GLOBE_VIEW_DIRECTION, camera.fov, stageW, stageH,
+        mode === 'road' ? { x: roadStep * 0.95, y: roadStep * 0.85 } : undefined);
+      // Size the zoom-out limit and far plane to this layout, so the whole site can always be seen
+      // and nothing is clipped. Small layouts keep the original limits (42 and 180).
+      controls.maxDistance = Math.max(42, fit.distance * 1.6);
+      camera.far = Math.max(180, (controls.maxDistance + fit.radius) * 1.1);
+      camera.updateProjectionMatrix();
+      cameraFlyRef.current = { active: true, lookTarget: fit.lookTarget, camTarget: fit.camTarget };
     };
 
     const unitSphereGeom = track(new THREE.SphereGeometry(1, 22, 22));

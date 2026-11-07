@@ -25,9 +25,19 @@ export interface RoadColumn {
   top: number;
 }
 
+/** Spacing the Road layout derived from the site's own nodes; the camera fit and frame reuse it for padding. */
+export interface RoadMetrics {
+  rowStep: number;
+  subColumnWidth: number;
+  columnGap: number;
+}
+
+export const DEFAULT_ROAD_METRICS: RoadMetrics = { rowStep: 0.95, subColumnWidth: 3.8, columnGap: 2.4 };
+
 export interface ComputedSiteLayouts {
   sectors: SectionSector[];
   roadColumns: RoadColumn[];
+  roadMetrics: RoadMetrics;
   globe: Map<string, [number, number, number]>;
   road: Map<string, [number, number, number]>;
   clusters: Map<string, [number, number, number]>;
@@ -227,7 +237,7 @@ export function computeSiteLayouts(manifest: SiteGraphManifest): ComputedSiteLay
   });
 
   // 2. SITEMAP ROAD LAYOUT: click depth columns left to right, each filled top to bottom.
-  const roadColumns = layoutRoad(nodes, homeNode, road);
+  const { columns: roadColumns, metrics: roadMetrics } = layoutRoad(nodes, homeNode, road);
 
   // 3. 3D LINK CLUSTERS (Deterministic 3D Force Relaxation seeded from Globe)
   const pos = new Map<string, [number, number, number]>();
@@ -322,12 +332,34 @@ export function computeSiteLayouts(manifest: SiteGraphManifest): ComputedSiteLay
     clusters.set(n.id, pos.get(n.id) ?? [0, 0, 0]);
   }
 
-  return { sectors, roadColumns, globe, road, clusters };
+  return { sectors, roadColumns, roadMetrics, globe, road, clusters };
 }
 
-const ROAD_ROW_STEP = 0.95;
-const ROAD_SUBCOLUMN_WIDTH = 3.8;
-const ROAD_COLUMN_GAP = 2.4;
+/** Characters a pill label is shown with (mirrors the 28 character cut-off used for node labels). */
+const ROAD_LABEL_MAX_CHARS = 28;
+
+function roadLabelChars(node: SiteNode): number {
+  if (node.kind === 'home') return 14;
+  const title = node.title.split('|')[0].split(' - ')[0].trim();
+  const text = title.length > 0 && title.length <= ROAD_LABEL_MAX_CHARS ? title : (node.path || '/');
+  return Math.min(ROAD_LABEL_MAX_CHARS, text.length);
+}
+
+/**
+ * Derives Road spacing from the nodes actually present, so it scales with the site:
+ * - sub-column width follows the longer labels (90th percentile), so labels fit without a wasted gutter;
+ * - row step tightens as the page count grows and relaxes for small sites.
+ * Both reproduce the former fixed values (0.95 / 3.8) for a ~64 page site with ~17 character labels.
+ */
+export function computeRoadMetrics(nodes: readonly SiteNode[]): RoadMetrics {
+  if (!nodes.length) return DEFAULT_ROAD_METRICS;
+  const lengths = nodes.map(roadLabelChars).sort((a, b) => a - b);
+  const labelChars = lengths[Math.min(lengths.length - 1, Math.floor(lengths.length * 0.9))];
+  const subColumnWidth = Math.min(5.6, Math.max(2.6, labelChars * 0.17 + 0.9));
+  const rowStep = Math.min(1.3, Math.max(0.7, 1.25 - 0.1 * Math.log2(Math.max(nodes.length, 8) / 8)));
+  return { rowStep, subColumnWidth, columnGap: subColumnWidth * (2.4 / 3.8) };
+}
+
 /** Wide enough for a typical 16:9 pane once the toolbar and filter bar are taken away. */
 const ROAD_TARGET_ASPECT = 2.2;
 
@@ -353,7 +385,9 @@ function roadColumnIndex(node: SiteNode, homeId: string | undefined): number {
  * The row count is chosen so the internal columns come out about as wide as a landscape pane;
  * a tall column wraps into side-by-side sub-columns instead of one long strip.
  */
-function layoutRoad(nodes: readonly SiteNode[], homeNode: SiteNode | undefined, out: Map<string, [number, number, number]>): RoadColumn[] {
+function layoutRoad(nodes: readonly SiteNode[], homeNode: SiteNode | undefined, out: Map<string, [number, number, number]>): { columns: RoadColumn[]; metrics: RoadMetrics } {
+  const metrics = computeRoadMetrics(nodes);
+  const { rowStep: ROAD_ROW_STEP, subColumnWidth: ROAD_SUBCOLUMN_WIDTH, columnGap: ROAD_COLUMN_GAP } = metrics;
   const buckets: SiteNode[][] = ROAD_COLUMN_DEFS.map(() => []);
   for (const node of nodes) buckets[roadColumnIndex(node, homeNode?.id)].push(node);
   for (const bucket of buckets) {
@@ -361,7 +395,7 @@ function layoutRoad(nodes: readonly SiteNode[], homeNode: SiteNode | undefined, 
       Number(b.kind === 'hub') - Number(a.kind === 'hub') || a.path.localeCompare(b.path));
   }
   const used = buckets.map((bucket, index) => ({ index, bucket })).filter(({ bucket }) => bucket.length > 0);
-  if (!used.length) return [];
+  if (!used.length) return { columns: [], metrics };
 
   const internal = used.filter(({ index }) => index !== 5);
   const sizeFor = (rows: number) => {
@@ -393,7 +427,7 @@ function layoutRoad(nodes: readonly SiteNode[], homeNode: SiteNode | undefined, 
       const x = left + (sub + 0.5) * ROAD_SUBCOLUMN_WIDTH;
       const y = ((inThisSub - 1) * 0.5 - row) * ROAD_ROW_STEP;
       // A slight alternating depth keeps the 3D feel when the camera orbits.
-      const z = ((row % 2) - 0.5) * 0.3;
+      const z = ((row % 2) - 0.5) * ROAD_ROW_STEP * 0.32;
       out.set(node.id, [x, y, z]);
     });
     columns.push({
@@ -414,5 +448,5 @@ function layoutRoad(nodes: readonly SiteNode[], homeNode: SiteNode | undefined, 
   const shift = -(span[0] + span[1]) / 2;
   for (const column of columns) { column.x += shift; column.left += shift; column.right += shift; }
   for (const [id, point] of out) out.set(id, [point[0] + shift, point[1], point[2]]);
-  return columns;
+  return { columns, metrics };
 }
