@@ -71,7 +71,6 @@ function sphericalToWorld(
 export function computeSiteLayouts(manifest: SiteGraphManifest): ComputedSiteLayouts {
   const globe = new Map<string, [number, number, number]>();
   const road = new Map<string, [number, number, number]>();
-  const clusters = new Map<string, [number, number, number]>();
 
   const nodes = manifest.nodes;
   const edges = manifest.edges;
@@ -240,99 +239,118 @@ export function computeSiteLayouts(manifest: SiteGraphManifest): ComputedSiteLay
   const { columns: roadColumns, metrics: roadMetrics } = layoutRoad(nodes, homeNode, road);
 
   // 3. 3D LINK CLUSTERS (Deterministic 3D Force Relaxation seeded from Globe)
-  const pos = new Map<string, [number, number, number]>();
-  for (const n of nodes) {
-    const g = globe.get(n.id) ?? [0, 0, 0];
-    pos.set(n.id, [g[0] * 0.85, g[1] * 0.85, g[2] * 0.85]);
-  }
+  // The force simulation is O(N^2) per iteration, so it is computed on first use rather than on load.
+  let clustersCache: Map<string, [number, number, number]> | null = null;
+  return {
+    sectors,
+    roadColumns,
+    roadMetrics,
+    globe,
+    road,
+    get clusters() {
+      return (clustersCache ??= relaxClusters(nodes, edges, homeNode, globe));
+    },
+  };
+}
 
-  const activeEdges: SiteEdge[] = edges.filter((e) => e.kind !== 'internal-chrome');
-  const idList = nodes.map((n) => n.id);
-  const vel = new Map<string, [number, number, number]>();
-  for (const id of idList) vel.set(id, [0, 0, 0]);
+/**
+ * Deterministic 3D force relaxation seeded from the globe layout. Flat typed arrays and index loops: the pairwise
+ * repulsion runs N^2/2 times per iteration, and string-keyed Map lookups in that loop dominated the cost.
+ * The arithmetic and its order match the earlier Map-based version, so the coordinates are identical.
+ */
+export function relaxClusters(
+  nodes: readonly SiteNode[],
+  edges: readonly SiteEdge[],
+  homeNode: SiteNode | undefined,
+  globe: ReadonlyMap<string, [number, number, number]>
+): Map<string, [number, number, number]> {
+  const n = nodes.length;
+  const px = new Float64Array(n), py = new Float64Array(n), pz = new Float64Array(n);
+  const vx = new Float64Array(n), vy = new Float64Array(n), vz = new Float64Array(n);
+  const indexById = new Map<string, number>();
+  let homeIndex = -1;
+  for (let i = 0; i < n; i++) {
+    const g = globe.get(nodes[i].id) ?? [0, 0, 0];
+    px[i] = g[0] * 0.85; py[i] = g[1] * 0.85; pz[i] = g[2] * 0.85;
+    indexById.set(nodes[i].id, i);
+    if (homeNode && nodes[i].id === homeNode.id) homeIndex = i;
+  }
 
   // Divide each link's spring by the busier endpoint's link count (as d3-force does), so a
   // hub with hundreds of links cannot overshoot and drive the relaxation unstable.
-  const degree = new Map<string, number>();
+  const activeEdges = edges.filter((e) => e.kind !== 'internal-chrome');
+  const degree = new Int32Array(n);
   for (const e of activeEdges) {
-    degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
-    degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
+    const s = indexById.get(e.source), t = indexById.get(e.target);
+    if (s !== undefined) degree[s]++;
+    if (t !== undefined) degree[t]++;
   }
-  const iterations = Math.min(90, Math.max(40, Math.round(1400 / Math.max(12, nodes.length))));
+  // Edges whose ends are both known, as parallel arrays: source, target, ideal length, stiffness.
+  const es: number[] = [], et: number[] = [], eideal: number[] = [], estiff: number[] = [];
+  for (const e of activeEdges) {
+    const s = indexById.get(e.source), t = indexById.get(e.target);
+    if (s === undefined || t === undefined) continue;
+    es.push(s); et.push(t);
+    eideal.push(e.kind === 'external' ? 5.6 : e.kind === 'sitemap-hierarchy' ? 3.2 : 3.8);
+    estiff.push(0.045 * Math.min(1, 8 / Math.max(degree[s], degree[t])));
+  }
+  const edgeCount = es.length;
+
+  const iterations = Math.min(90, Math.max(40, Math.round(1400 / Math.max(12, n))));
   for (let iter = 0; iter < iterations; iter++) {
     const alpha = 1 - iter / iterations;
+    const k = 0.52 * alpha;
     // Repulsion
-    for (let i = 0; i < idList.length; i++) {
-      const pA = pos.get(idList[i])!;
-      const vA = vel.get(idList[i])!;
-      for (let j = i + 1; j < idList.length; j++) {
-        const pB = pos.get(idList[j])!;
-        const vB = vel.get(idList[j])!;
-        const dx = pA[0] - pB[0];
-        const dy = pA[1] - pB[1];
-        const dz = pA[2] - pB[2];
+    for (let i = 0; i < n; i++) {
+      const ax = px[i], ay = py[i], az = pz[i];
+      let vax = vx[i], vay = vy[i], vaz = vz[i];
+      for (let j = i + 1; j < n; j++) {
+        const dx = ax - px[j];
+        const dy = ay - py[j];
+        const dz = az - pz[j];
         const dSq = Math.max(0.25, dx * dx + dy * dy + dz * dz);
-        const f = (0.52 * alpha) / dSq;
+        const f = k / dSq;
         const dist = Math.sqrt(dSq);
         const fx = (dx / dist) * f;
         const fy = (dy / dist) * f;
         const fz = (dz / dist) * f;
-        vA[0] += fx;
-        vA[1] += fy;
-        vA[2] += fz;
-        vB[0] -= fx;
-        vB[1] -= fy;
-        vB[2] -= fz;
+        vax += fx; vay += fy; vaz += fz;
+        vx[j] -= fx; vy[j] -= fy; vz[j] -= fz;
       }
+      vx[i] = vax; vy[i] = vay; vz[i] = vaz;
     }
 
     // Spring attraction
-    for (const e of activeEdges) {
-      const pS = pos.get(e.source);
-      const pT = pos.get(e.target);
-      if (!pS || !pT) continue;
-      const vS = vel.get(e.source)!;
-      const vT = vel.get(e.target)!;
-      const ideal = e.kind === 'external' ? 5.6 : e.kind === 'sitemap-hierarchy' ? 3.2 : 3.8;
-      const dx = pT[0] - pS[0];
-      const dy = pT[1] - pS[1];
-      const dz = pT[2] - pS[2];
+    for (let e = 0; e < edgeCount; e++) {
+      const s = es[e], t = et[e];
+      const dx = px[t] - px[s];
+      const dy = py[t] - py[s];
+      const dz = pz[t] - pz[s];
       const dist = Math.max(0.1, Math.hypot(dx, dy, dz));
-      const stiffness = 0.045 * Math.min(1, 8 / Math.max(degree.get(e.source) ?? 1, degree.get(e.target) ?? 1));
-      const pull = (dist - ideal) * stiffness * alpha;
+      const pull = (dist - eideal[e]) * estiff[e] * alpha;
       const fx = (dx / dist) * pull;
       const fy = (dy / dist) * pull;
       const fz = (dz / dist) * pull;
-      vS[0] += fx;
-      vS[1] += fy;
-      vS[2] += fz;
-      vT[0] -= fx;
-      vT[1] -= fy;
-      vT[2] -= fz;
+      vx[s] += fx; vy[s] += fy; vz[s] += fz;
+      vx[t] -= fx; vy[t] -= fy; vz[t] -= fz;
     }
 
     // Centering + integrate
-    for (const n of nodes) {
-      if (homeNode && n.id === homeNode.id) {
-        pos.set(n.id, [0, 0, 0]);
+    for (let i = 0; i < n; i++) {
+      if (i === homeIndex) {
+        px[i] = 0; py[i] = 0; pz[i] = 0;
         continue;
       }
-      const p = pos.get(n.id)!;
-      const v = vel.get(n.id)!;
-      p[0] = (p[0] + v[0]) * 0.995;
-      p[1] = (p[1] + v[1]) * 0.995;
-      p[2] = (p[2] + v[2]) * 0.995;
-      v[0] *= 0.6;
-      v[1] *= 0.6;
-      v[2] *= 0.6;
+      px[i] = (px[i] + vx[i]) * 0.995;
+      py[i] = (py[i] + vy[i]) * 0.995;
+      pz[i] = (pz[i] + vz[i]) * 0.995;
+      vx[i] *= 0.6; vy[i] *= 0.6; vz[i] *= 0.6;
     }
   }
 
-  for (const n of nodes) {
-    clusters.set(n.id, pos.get(n.id) ?? [0, 0, 0]);
-  }
-
-  return { sectors, roadColumns, roadMetrics, globe, road, clusters };
+  const clusters = new Map<string, [number, number, number]>();
+  for (let i = 0; i < n; i++) clusters.set(nodes[i].id, [px[i], py[i], pz[i]]);
+  return clusters;
 }
 
 /** Characters a pill label is shown with (mirrors the 28 character cut-off used for node labels). */
