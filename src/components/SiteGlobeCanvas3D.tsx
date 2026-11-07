@@ -97,6 +97,8 @@ interface LabelSlot {
   badgeEl: HTMLSpanElement | null;
   obj: CSS2DObject;
   entry: RuntimeNodeEntry | null;
+  /** Bound this frame: stays transparent for one rendered frame so the CSS opacity transition can fade it in. */
+  fresh: boolean;
 }
 
 /** Home node only: a standalone sphere (and brand badge). Every other node is an instance of a shared mesh. */
@@ -170,7 +172,9 @@ interface LabelContext {
 const BADGE_SCALE = 2.8;
 
 /** A label pill is about 70 by 24 px, so more than this cannot be placed on a screen without overlap. */
-const MAX_LABEL_CANDIDATES = 320;
+const MAX_LABEL_CANDIDATES = 800;
+/** Matches the 0.18s opacity transition on .wo-node-pill. */
+const LABEL_FADE_MS = 220;
 /** The halo quad spans this many node radii; the ring itself runs from 1.32 to 1.65. */
 const HALO_PAD = 1.7;
 
@@ -781,7 +785,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       const textEl = document.createElement('span');
       textEl.className = 'wo-pill-label';
       el.append(dotEl, textEl);
-      const slot: LabelSlot = { el, textEl, badgeEl: null, obj: new CSS2DObject(el), entry: null };
+      const slot: LabelSlot = { el, textEl, badgeEl: null, obj: new CSS2DObject(el), entry: null, fresh: false };
       // The handlers read the slot's current node, so a slot can be handed from one node to another.
       el.addEventListener('pointerenter', () => { if (slot.entry) callbacksRef.current.onHoverNode(slot.entry.node.id); });
       el.addEventListener('pointerleave', () => { callbacksRef.current.onHoverNode(null); });
@@ -813,7 +817,8 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       const { node } = entry;
       slot.entry = entry;
       entry.label = slot;
-      slot.el.className = `wo-node-pill wo-health-${node.health} wo-kind-${node.kind}`;
+      slot.el.className = `wo-node-pill wo-health-${node.health} wo-kind-${node.kind} is-hidden`;
+      slot.fresh = true;
       slot.el.dataset.nodeId = node.id;
       slot.textEl.textContent = entry.pillText;
       slot.badgeEl?.remove();
@@ -830,18 +835,38 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       slot.obj.visible = true;
     };
 
-    const unbindLabel = (entry: RuntimeNodeEntry) => {
+    const unbindLabel = (entry: RuntimeNodeEntry, immediate = false) => {
       const slot = entry.label;
       if (!slot) return;
       slot.entry = null;
       entry.label = null;
-      // Drop the state classes too: a released pill must not keep matching .is-active or .is-hover-target.
-      slot.el.className = 'wo-node-pill is-hidden';
+      // Fade out like a hidden pill used to, then return the slot to the pool once the transition has finished.
+      // The state classes go at once: a releasing pill must not keep matching .is-active or .is-hover-target.
+      slot.fresh = false;
+      slot.el.classList.remove('is-active', 'is-hover-target', 'is-hover-context');
+      slot.el.classList.add('is-hidden');
       slot.el.removeAttribute('aria-pressed');
-      slot.el.style.translate = '';
       delete slot.el.dataset.nodeId;
-      slot.obj.visible = false;
-      freeLabels.push(slot);
+      if (immediate) {
+        slot.obj.visible = false;
+        freeLabels.push(slot);
+        return;
+      }
+      window.setTimeout(() => {
+        if (slot.entry || disposed) return;
+        slot.obj.visible = false;
+        slot.el.style.translate = '';
+        freeLabels.push(slot);
+      }, LABEL_FADE_MS);
+    };
+    // Shows a placed label; a freshly bound one waits a frame so it fades in instead of popping.
+    const revealLabel = (slot: LabelSlot) => {
+      if (slot.fresh) {
+        slot.fresh = false;
+        forceLabels = true;
+        return;
+      }
+      slot.el.classList.remove('is-hidden');
     };
 
     // Every edge lives in one LineSegments object: one draw call and one material however many links the
@@ -878,7 +903,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
 
     const clearRuntimeGraph = () => {
       runtimeNodes.forEach((entry) => {
-        unbindLabel(entry);
+        unbindLabel(entry, true);
         if (entry.badge) {
           entry.badge.disposed = true;
           entry.badge.texture.dispose();
@@ -1682,7 +1707,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
 
         if (entry.node.id === focusId || (!focusId && entry.node.kind === 'home')) {
           placedBoxes.push(box);
-          entry.label!.el.classList.remove('is-hidden');
+          revealLabel(entry.label!);
           continue;
         }
 
@@ -1705,7 +1730,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
           const [dx, dy] = freeSlot;
           entry.label!.el.style.translate = `${dx}px ${dy}px`;
           placedBoxes.push({ l: box.l + dx, r: box.r + dx, t: box.t + dy, b: box.b + dy });
-          entry.label!.el.classList.remove('is-hidden');
+          revealLabel(entry.label!);
         }
       }
 
