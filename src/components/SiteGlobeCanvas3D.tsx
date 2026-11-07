@@ -760,8 +760,6 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
 
     const runtimeNodes = new Map<string, RuntimeNodeEntry>();
     const runtimeEdges = new Map<string, RuntimeEdgeEntry>();
-    // Picking targets: the home sphere plus the instanced node meshes (see NodeInstancing).
-    let pickTargets: THREE.Object3D[] = [];
     let nodeInst: NodeInstancing | null = null;
 
     // Pooled labels live under their own group so each follows its node through the spin group.
@@ -837,7 +835,10 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       if (!slot) return;
       slot.entry = null;
       entry.label = null;
-      slot.el.classList.add('is-hidden');
+      // Drop the state classes too: a released pill must not keep matching .is-active or .is-hover-target.
+      slot.el.className = 'wo-node-pill is-hidden';
+      slot.el.removeAttribute('aria-pressed');
+      slot.el.style.translate = '';
       delete slot.el.dataset.nodeId;
       slot.obj.visible = false;
       freeLabels.push(slot);
@@ -889,7 +890,6 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         }
       });
       runtimeNodes.clear();
-      pickTargets = [];
       disposeNodeInstancing();
       labelCtx = emptyLabelContext();
 
@@ -991,8 +991,6 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
         mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
         mesh.count = nodeCount;
         mesh.frustumCulled = false;
-        // Hidden instances sit far away, so a bounding sphere computed from them is useless; the ray test uses this one.
-        mesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e12);
         for (let i = 0; i < capacity; i++) {
           mesh.setMatrixAt(i, hiddenInstanceMat);
           mesh.setColorAt(i, white);
@@ -1051,7 +1049,6 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       nodesRoot.add(halo);
 
       const byIndex: RuntimeNodeEntry[] = [];
-      const homeTargets: THREE.Object3D[] = [];
 
       nextManifest.nodes.forEach((node, index) => {
         const initPos = curLayouts.globe.get(node.id) ?? [0, 0, 0];
@@ -1098,9 +1095,7 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
           });
           const coreMesh = new THREE.Mesh(homeSphereGeom, coreMat);
           coreMesh.scale.setScalar(baseRadius);
-          coreMesh.userData = { nodeId: node.id };
           group.add(coreMesh);
-          homeTargets.push(coreMesh);
 
           // The home node shows the site's own mark. The sphere stays as an invisible depth occluder
           // and click target, so links still end at the centre and picking is unchanged.
@@ -1159,7 +1154,6 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
       });
 
       nodeInst = { coreGeom, buckets, mats, halo, haloCenter, haloColor, haloSize, byIndex };
-      pickTargets = [...homeTargets, ...buckets];
 
       if (nextManifest.edges.length > pulseCapacity) {
         edgesRoot.remove(pulseInstanced);
@@ -1264,19 +1258,35 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
     const pointer = new THREE.Vector2();
     let downPos = { x: 0, y: 0 };
 
+    // A ray against every visible node as an exact sphere: cheaper than raycasting instanced triangle meshes, and a
+    // low-poly instance mesh would otherwise shrink each node's clickable area at its edge.
+    const pickRay = new THREE.Ray();
+    const pickInverse = new THREE.Matrix4();
+    const pickSphere = new THREE.Sphere();
+    const pickHit = new THREE.Vector3();
     const pickNodeAt = (clientX: number, clientY: number): string | null => {
       const rect = renderer.domElement.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return null;
       pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
       pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
       raycaster.setFromCamera(pointer, camera);
-      // Hidden node instances sit far from the scene and the home sphere is skipped while filtered out.
-      const targets = pickTargets.filter((object) => object.parent?.visible !== false);
-      const hits = raycaster.intersectObjects(targets, false);
-      if (hits.length === 0) return null;
-      const hit = hits[0];
-      if (hit.instanceId !== undefined) return nodeInst?.byIndex[hit.instanceId]?.node.id ?? null;
-      return (hit.object.userData?.nodeId as string) ?? null;
+      // Nodes are positioned in the spin group's space, so the ray goes there rather than every node going to world space.
+      sceneSpinGroup.updateWorldMatrix(true, false);
+      pickRay.copy(raycaster.ray).applyMatrix4(pickInverse.copy(sceneSpinGroup.matrixWorld).invert());
+      let best: string | null = null;
+      let bestDistSq = Infinity;
+      for (const entry of runtimeNodes.values()) {
+        if (!entry.visible) continue;
+        pickSphere.center.copy(entry.currentPos);
+        pickSphere.radius = entry.home ? entry.home.coreMesh.scale.x : entry.baseRadius;
+        if (pickRay.intersectSphere(pickSphere, pickHit) === null) continue;
+        const distSq = pickHit.distanceToSquared(pickRay.origin);
+        if (distSq < bestDistSq) {
+          bestDistSq = distSq;
+          best = entry.node.id;
+        }
+      }
+      return best;
     };
 
     const onLabelOver = (ev: MouseEvent) => {
