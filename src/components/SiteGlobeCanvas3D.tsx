@@ -293,6 +293,8 @@ export const SiteGlobeCanvas3D: React.FC<SiteGlobeCanvas3DProps> = ({
     () => (manifest ? computeSiteLayouts(manifest) : null),
     [manifest]
   );
+  // Work out the Clusters layout in small idle slices, so opening that view is instant even on a large site.
+  useEffect(() => layouts?.prefetchClusters?.(), [layouts]);
   const attention = useMemo(() => attentionNodeIds(manifest), [manifest]);
   const discoveryNodes = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
