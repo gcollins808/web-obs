@@ -128,7 +128,7 @@ test('the map wires the badge to the host and keeps the home sphere as its click
   const view = fs.readFileSync('src/plugin/SiteGlobeView.ts', 'utf8');
   assert.match(app, /readAssetBytes=\{activeHost\.readAssetBytes\}/);
   assert.match(canvas, /coreMat\.colorWrite = false/, 'the sphere still occludes links and takes clicks');
-  assert.match(canvas, /pickableMeshes\.push\(coreMesh\)/);
+  assert.match(canvas, /entry\.home \? entry\.home\.coreMesh\.scale\.x/, 'picking tests the home sphere at its full badge size');
   assert.match(canvas, /entry\.badge\.texture\.dispose\(\)/, 'badge textures are released with the graph');
   assert.match(view, /readAssetBytes: async/);
   assert.match(view, /MAX_MAP_ASSET_BYTES/);
